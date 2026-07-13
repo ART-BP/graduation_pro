@@ -60,14 +60,15 @@ private:
     sensor_msgs::PointCloud2ConstIterator<double> in_timestamp(*msg, "timestamp");
 
     const double first_point_time = *in_timestamp;
-    double frame_start_time = msg->header.stamp.toSec();
+    const double msg_stamp = msg->header.stamp.toSec();
+    const bool header_time_valid =
+        std::isfinite(msg_stamp) && msg_stamp > 1e-6;
+    const bool point_time_valid = std::isfinite(first_point_time);
+    const bool point_time_is_absolute =
+        point_time_valid && first_point_time > 1e6;
 
-    // The official Hesai driver normally sets header.stamp to frame start.
-    // Fall back to the first point timestamp if the header is invalid or
-    // clearly belongs to a different time base.
-    if (!std::isfinite(frame_start_time) || frame_start_time <= 0.0 ||
-        !std::isfinite(first_point_time) ||
-        std::fabs(first_point_time - frame_start_time) > 1.0) {
+    double frame_start_time = header_time_valid ? msg_stamp : 0.0;
+    if (!header_time_valid && point_time_is_absolute) {
       frame_start_time = first_point_time;
     }
 
@@ -104,7 +105,14 @@ private:
          ++i, ++in_x, ++in_y, ++in_z, ++in_intensity, ++in_ring,
          ++in_timestamp, ++out_x, ++out_y, ++out_z, ++out_intensity,
          ++out_ring, ++out_time) {
-      double relative_time = *in_timestamp - frame_start_time;
+      double relative_time = 0.0;
+      if (point_time_is_absolute) {
+        relative_time = *in_timestamp - frame_start_time;
+      } else {
+        // Some Hesai bags store per-point timestamp as scan-relative seconds.
+        // In that case the ROS header is still the frame start time.
+        relative_time = *in_timestamp;
+      }
 
       if (!std::isfinite(relative_time)) {
         relative_time = 0.0;

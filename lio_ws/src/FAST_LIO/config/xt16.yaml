@@ -1,6 +1,6 @@
 common:
-  lid_topic: "/lidar_points"
-  imu_topic: "/imu/data"
+  lid_topic: "/lidar_points_fastlio"
+  imu_topic: "/Imu"
   time_sync_en: false
   time_offset_lidar_to_imu: 0.0
 
