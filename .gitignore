@@ -1,0 +1,51 @@
+# ROS / catkin workspaces
+**/build/
+**/devel/
+**/install/
+**/.catkin_workspace
+.catkin_tools/
+logs/
+log/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+CTestConfiguration.ini
+CTestCustom.cmake
+cmake_install.cmake
+catkin_make.cache
+compile_commands.json
+
+# Generated binaries and libraries
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# ROS runtime data
+*.bag
+*.bag.active
+*.db3
+*.pcd
+*.ply
+*.bt
+*.pgm
+*.yaml.tmp
+lio_ws/src/FAST_LIO/PCD/
+lio_ws/src/FAST_LIO/Log/*.txt
+
+# Python / editor / OS cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
