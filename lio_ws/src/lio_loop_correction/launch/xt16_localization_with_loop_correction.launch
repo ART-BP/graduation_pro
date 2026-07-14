@@ -1,0 +1,23 @@
+<launch>
+  <arg name="rviz" default="true"/>
+  <arg name="lidar_input_topic" default="/lidar_points"/>
+  <arg name="odom_topic" default="/Odometry"/>
+  <arg name="cloud_topic" default="/cloud_registered_body"/>
+  <arg name="map_frame" default="map"/>
+  <arg name="odom_frame" default="odom"/>
+  <arg name="body_frame" default="base_link"/>
+
+  <include file="$(find fast_lio)/launch/mapping_xt16.launch">
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="lidar_input_topic" value="$(arg lidar_input_topic)"/>
+  </include>
+
+  <include file="$(find lio_loop_correction)/launch/lio_loop_correction.launch">
+    <arg name="odom_topic" value="$(arg odom_topic)"/>
+    <arg name="cloud_topic" value="$(arg cloud_topic)"/>
+    <arg name="map_frame" value="$(arg map_frame)"/>
+    <arg name="odom_frame" value="$(arg odom_frame)"/>
+    <arg name="body_frame" value="$(arg body_frame)"/>
+    <arg name="world_frame" value="$(arg map_frame)"/>
+  </include>
+</launch>
