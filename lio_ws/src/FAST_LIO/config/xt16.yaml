@@ -1,14 +1,17 @@
 common:
-  lid_topic: "/lidar_points_fastlio"
+  lid_topic: "/lidar_points"
   imu_topic: "/Imu"
+  world_frame: "odom"
+  body_frame: "base_link"
   time_sync_en: false
   time_offset_lidar_to_imu: 0.0
 
 preprocess:
-  lidar_type: 2
+  lidar_type: 5                  # Direct Hesai PointCloud2 input.
   scan_line: 16
   scan_rate: 10
-  timestamp_unit: 0
+  timestamp_unit: 0              # Hesai timestamps are handled directly in seconds.
+  max_scan_duration: 0.2
   blind: 0.5
 
 mapping:
@@ -22,16 +25,19 @@ mapping:
   # FAST-LIO expects the LiDAR pose expressed in the IMU frame:
   # p_imu = extrinsic_R * p_lidar + extrinsic_T
   extrinsic_est_en: false
-  extrinsic_T: [0.0, 0.0, 0.0]
-  extrinsic_R: [1.0, 0.0, 0.0,
-                0.0, 1.0, 0.0,
-                0.0, 0.0, 1.0]
+  extrinsic_T: [0.171, 0.0, 0.0908]
+  extrinsic_R: [0.0, -1.0, 0.0,
+                1.0,  0.0, 0.0,
+                0.0,  0.0, 1.0]
 
 publish:
-  path_en: false
+  path_en: true
   scan_publish_en: true
   dense_publish_en: false
   scan_bodyframe_pub_en: true
+  effect_publish_en: true
+  map_publish_en: true
+  map_publish_interval: 10
 
 pcd_save:
   pcd_save_en: false

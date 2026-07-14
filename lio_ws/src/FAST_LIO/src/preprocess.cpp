@@ -1,10 +1,14 @@
 #include "preprocess.h"
+#include <sensor_msgs/point_cloud2_iterator.h>
+
+#include <cmath>
 
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
 
 Preprocess::Preprocess()
-  :feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
+  :feature_enabled(0), lidar_type(AVIA), point_filter_num(1), blind(0.01),
+   max_scan_duration(0.2), scan_start_time(0.0)
 {
   inf_bound = 10;
   N_SCANS   = 6;
@@ -81,12 +85,192 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
   case MARSIM:
     sim_handler(msg);
     break;
+
+  case HESAI:
+    hesai_handler(msg);
+    break;
   
   default:
     printf("Error LiDAR Type");
     break;
   }
   *pcl_out = pl_surf;
+}
+
+void Preprocess::hesai_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+  scan_start_time = msg->header.stamp.toSec();
+
+  const size_t point_count = static_cast<size_t>(msg->width) * msg->height;
+  if (point_count == 0) return;
+
+  struct RequiredField
+  {
+    const char *name;
+    uint8_t datatype;
+  };
+  const RequiredField required_fields[] = {
+      {"x", sensor_msgs::PointField::FLOAT32},
+      {"y", sensor_msgs::PointField::FLOAT32},
+      {"z", sensor_msgs::PointField::FLOAT32},
+      {"intensity", sensor_msgs::PointField::FLOAT32},
+      {"ring", sensor_msgs::PointField::UINT16},
+      {"timestamp", sensor_msgs::PointField::FLOAT64}};
+
+  for (const RequiredField &required : required_fields)
+  {
+    const sensor_msgs::PointField *matched_field = nullptr;
+    for (const sensor_msgs::PointField &field : msg->fields)
+    {
+      if (field.name == required.name)
+      {
+        matched_field = &field;
+        break;
+      }
+    }
+
+    if (matched_field == nullptr || matched_field->datatype != required.datatype ||
+        matched_field->count != 1)
+    {
+      ROS_ERROR_THROTTLE(
+          2.0,
+          "Invalid Hesai PointCloud2 field '%s': missing or unexpected datatype.",
+          required.name);
+      return;
+    }
+  }
+
+  sensor_msgs::PointCloud2ConstIterator<float> in_x(*msg, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> in_y(*msg, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> in_z(*msg, "z");
+  sensor_msgs::PointCloud2ConstIterator<float> in_intensity(*msg, "intensity");
+  sensor_msgs::PointCloud2ConstIterator<uint16_t> in_ring(*msg, "ring");
+  sensor_msgs::PointCloud2ConstIterator<double> in_timestamp(*msg, "timestamp");
+
+  const double first_point_time = *in_timestamp;
+  const double header_time = msg->header.stamp.toSec();
+  const bool header_time_valid = std::isfinite(header_time) && header_time > 1e-6;
+  const bool point_time_valid = std::isfinite(first_point_time);
+  const bool point_time_is_absolute =
+      point_time_valid &&
+      (first_point_time > 1e6 ||
+       (first_point_time > 2.0 * max_scan_duration && header_time_valid &&
+        std::fabs(first_point_time - header_time) < 1.0));
+
+  if (point_time_is_absolute)
+  {
+    scan_start_time = first_point_time;
+  }
+  else if (!header_time_valid)
+  {
+    ROS_ERROR_THROTTLE(
+        2.0,
+        "Hesai cloud has relative point timestamps but an invalid ROS header timestamp.");
+    return;
+  }
+
+  if (feature_enabled)
+  {
+    for (int line = 0; line < N_SCANS; ++line)
+    {
+      pl_buff[line].clear();
+      pl_buff[line].reserve(point_count / std::max(1, N_SCANS));
+    }
+  }
+  else
+  {
+    pl_surf.reserve(point_count / std::max(1, point_filter_num));
+  }
+
+  const int filter_stride = std::max(1, point_filter_num);
+  size_t invalid_time_count = 0;
+  size_t invalid_ring_count = 0;
+  for (size_t i = 0; i < point_count;
+       ++i, ++in_x, ++in_y, ++in_z, ++in_intensity, ++in_ring, ++in_timestamp)
+  {
+    if (*in_ring >= N_SCANS)
+    {
+      ++invalid_ring_count;
+      continue;
+    }
+
+    double relative_time = point_time_is_absolute
+                               ? (*in_timestamp - scan_start_time)
+                               : *in_timestamp;
+    if (relative_time < 0.0 && relative_time > -1e-4)
+    {
+      relative_time = 0.0;
+    }
+    if (!std::isfinite(relative_time) || relative_time < 0.0 ||
+        relative_time > max_scan_duration)
+    {
+      ++invalid_time_count;
+      continue;
+    }
+
+    if (!feature_enabled && i % filter_stride != 0) continue;
+
+    const double range = static_cast<double>(*in_x) * *in_x +
+                         static_cast<double>(*in_y) * *in_y +
+                         static_cast<double>(*in_z) * *in_z;
+    if (!std::isfinite(range) || range < blind * blind) continue;
+
+    PointType added_pt;
+    added_pt.x = *in_x;
+    added_pt.y = *in_y;
+    added_pt.z = *in_z;
+    added_pt.intensity = *in_intensity;
+    added_pt.normal_x = 0.0f;
+    added_pt.normal_y = 0.0f;
+    added_pt.normal_z = 0.0f;
+    added_pt.curvature = relative_time * 1000.0;  // FAST-LIO uses milliseconds.
+
+    if (feature_enabled)
+    {
+      pl_buff[*in_ring].push_back(added_pt);
+    }
+    else
+    {
+      pl_surf.push_back(added_pt);
+    }
+  }
+
+  if (invalid_time_count > 0)
+  {
+    ROS_WARN_THROTTLE(2.0, "Dropped %zu Hesai points with invalid timestamps.",
+                      invalid_time_count);
+  }
+  if (invalid_ring_count > 0)
+  {
+    ROS_WARN_THROTTLE(2.0, "Dropped %zu Hesai points outside %d scan lines.",
+                      invalid_ring_count, N_SCANS);
+  }
+
+  if (feature_enabled)
+  {
+    for (int line = 0; line < N_SCANS; ++line)
+    {
+      PointCloudXYZI &line_cloud = pl_buff[line];
+      if (line_cloud.size() < 2) continue;
+
+      vector<orgtype> &types = typess[line];
+      types.clear();
+      types.resize(line_cloud.size());
+      for (size_t i = 0; i + 1 < line_cloud.size(); ++i)
+      {
+        types[i].range = std::hypot(line_cloud[i].x, line_cloud[i].y);
+        const double dx = line_cloud[i].x - line_cloud[i + 1].x;
+        const double dy = line_cloud[i].y - line_cloud[i + 1].y;
+        const double dz = line_cloud[i].z - line_cloud[i + 1].z;
+        types[i].dista = dx * dx + dy * dy + dz * dz;
+      }
+      types.back().range = std::hypot(line_cloud.back().x, line_cloud.back().y);
+      give_feature(line_cloud, types);
+    }
+  }
 }
 
 void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
