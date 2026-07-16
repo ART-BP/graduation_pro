@@ -1,0 +1,17 @@
+grid_map_topic: /local_environment/grid_map
+grid_map_visualizations:
+  - name: ground
+    type: point_cloud
+    params:
+      layer: ground_height
+  - name: ceiling
+    type: point_cloud
+    params:
+      layer: ceiling_height
+  - name: blocked
+    type: occupancy_grid
+    params:
+      layer: blocked
+      data_min: 0.0
+      data_max: 1.0
+

@@ -12,4 +12,4 @@ fi
 
 source "${WORKSPACE_DIR}/devel/setup.bash"
 
-exec roslaunch lio_loop_correction xt16_localization_with_loop_correction.launch "$@"
+exec roslaunch fast_lio mapping_xt16.launch "$@"

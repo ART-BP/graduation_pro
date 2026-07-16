@@ -1,0 +1,36 @@
+map:
+  frame_id: odom
+  length_x: 20.0
+  length_y: 20.0
+  resolution: 0.20
+
+publish_rate: 5.0
+# Maximum wall-clock age since each input was received by this node.
+maximum_input_age: 1.0
+use_unknown_cloud: true
+
+topics:
+  odometry: /Odometry
+  occupied_cloud: /rog_map_node/rog_map/occ
+  unknown_cloud: /rog_map_node/rog_map/unk
+  grid_map: /local_environment/grid_map
+  blocked_map: /local_environment/blocked
+
+projection:
+  # Must match the ROG-Map probability-map resolution.
+  voxel_resolution: 0.10
+
+  # Vertical projection volume relative to the FAST-LIO2 body position.
+  vertical_min_offset: -1.50
+  vertical_max_offset: 2.00
+
+  # Ground candidates relative to the body position.
+  ground_search_min_offset: -1.20
+  ground_search_max_offset: 0.30
+  # Initial base_link-to-ground estimate. Tune from stationary data.
+  nominal_ground_offset: -0.35
+
+  # Initial conservative value; calibrate against the real Go2W posture.
+  minimum_clearance: 0.65
+  maximum_unknown_fraction: 0.20
+  unknown_is_blocked: false

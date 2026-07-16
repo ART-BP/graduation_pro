@@ -186,6 +186,7 @@ void Preprocess::hesai_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   }
 
   const int filter_stride = std::max(1, point_filter_num);
+  std::vector<size_t> ring_point_indices(std::max(1, N_SCANS), 0);
   size_t invalid_time_count = 0;
   size_t invalid_ring_count = 0;
   for (size_t i = 0; i < point_count;
@@ -211,7 +212,12 @@ void Preprocess::hesai_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
       continue;
     }
 
-    if (!feature_enabled && i % filter_stride != 0) continue;
+    // Hesai packets interleave the scan lines (0, 1, ..., N_SCANS - 1).
+    // Filtering by the global point index would therefore discard entire
+    // rings when point_filter_num shares a factor with N_SCANS. Downsample
+    // independently within each ring so all scan lines remain represented.
+    const size_t ring_point_index = ring_point_indices[*in_ring]++;
+    if (!feature_enabled && ring_point_index % filter_stride != 0) continue;
 
     const double range = static_cast<double>(*in_x) * *in_x +
                          static_cast<double>(*in_y) * *in_y +

@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>go2w_local_environment</name>
+  <version>0.1.0</version>
+  <description>
+    Robot-centric dual-layer elevation and vertical-clearance projection for
+    the Unitree Go2W local navigation stack.
+  </description>
+
+  <maintainer email="maintainer@example.com">Go2W Navigation Project</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>grid_map_core</depend>
+  <depend>grid_map_msgs</depend>
+  <depend>grid_map_ros</depend>
+  <depend>nav_msgs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+
+  <test_depend>rostest</test_depend>
+
+  <export/>
+</package>
+

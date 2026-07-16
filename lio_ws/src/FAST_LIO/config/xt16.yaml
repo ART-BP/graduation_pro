@@ -16,9 +16,12 @@ preprocess:
 
 mapping:
   acc_cov: 0.1
-  gyr_cov: 0.1
+  # The Go2 IMU stationary data in the supplied bags is around 1e-4
+  # rad^2/s^2. A smaller process covariance keeps yaw observable when the
+  # 16-line LiDAR passes through geometrically degenerate areas.
+  gyr_cov: 0.001
   b_acc_cov: 0.0001
-  b_gyr_cov: 0.0001
+  b_gyr_cov: 0.000001
   fov_degree: 180
   det_range: 100.0
 
@@ -35,8 +38,8 @@ publish:
   scan_publish_en: true
   dense_publish_en: false
   scan_bodyframe_pub_en: true
-  effect_publish_en: true
-  map_publish_en: true
+  effect_publish_en: false
+  map_publish_en: false
   map_publish_interval: 10
 
 pcd_save:

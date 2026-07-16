@@ -1,0 +1,58 @@
+# Load this file inside a ROG-Map node named "rog_map_node", for example
+# with a <rosparam> tag nested in that <node>. The topic defaults in
+# projector.yaml assume that node name.
+rog_map:
+  resolution: 0.1
+  inflation_resolution: 0.2
+  inflation_step: 1
+  unk_inflation_en: false
+  unk_inflation_step: 1
+  map_size: [24, 24, 5]
+  fix_map_origin: [0, 0, 0]
+  frontier_extraction_en: false
+
+  virtual_ceil_height: 9999
+  virtual_ground_height: -9999
+  load_pcd_en: false
+
+  map_sliding:
+    enable: true
+    threshold: 0.3
+
+  esdf:
+    enable: false
+    resolution: 0.1
+    local_update_box: [5, 5, 3]
+
+  ros_callback:
+    enable: true
+    cloud_topic: /cloud_registered
+    odom_topic: /Odometry
+    odom_timeout: 1.0
+
+  visualization:
+    enable: true
+    use_dynamic_reconfigure: false
+    time_rate: 5
+    frame_rate: 0
+    range: [20, 20, 4]
+    frame_id: odom
+    # Required by the projection node to distinguish known free voxels
+    # from unknown voxels.
+    pub_unknown_map_en: true
+
+  intensity_thresh: -10
+  point_filt_num: 2
+
+  raycasting:
+    enable: true
+    batch_update_size: 1
+    local_update_box: [24, 24, 5]
+    ray_range: [0.5, 15.0]
+    p_min: 0.12
+    p_miss: 0.49
+    p_free: 0.499
+    p_occ: 0.85
+    p_hit: 0.9
+    p_max: 0.98
+    unk_thresh: 1.0
