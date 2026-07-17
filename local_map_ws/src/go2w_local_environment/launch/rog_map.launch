@@ -1,0 +1,17 @@
+<launch>
+  <arg name="config"
+       default="$(find go2w_local_environment)/config/rog_map_go2w.yaml"/>
+  <arg name="cloud_topic" default="/cloud_registered"/>
+  <arg name="odometry_topic" default="/Odometry"/>
+
+  <node pkg="go2w_local_environment"
+        type="rog_map_node"
+        name="rog_map_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="rog_map/ros_callback/cloud_topic"
+           value="$(arg cloud_topic)"/>
+    <param name="rog_map/ros_callback/odom_topic"
+           value="$(arg odometry_topic)"/>
+  </node>
+</launch>

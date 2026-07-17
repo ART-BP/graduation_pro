@@ -12,17 +12,15 @@ preprocess:
   scan_rate: 10
   timestamp_unit: 0              # Hesai timestamps are handled directly in seconds.
   max_scan_duration: 0.2
-  blind: 0.5
+  blind: 0.2
 
 mapping:
   acc_cov: 0.1
-  # The Go2 IMU stationary data in the supplied bags is around 1e-4
-  # rad^2/s^2. A smaller process covariance keeps yaw observable when the
-  # 16-line LiDAR passes through geometrically degenerate areas.
-  gyr_cov: 0.001
+  # Match the Go2-tuned FAST-LIO2 configuration used by lioll_ws.
+  gyr_cov: 0.0001
   b_acc_cov: 0.0001
-  b_gyr_cov: 0.000001
-  fov_degree: 180
+  b_gyr_cov: 0.0001
+  fov_degree: 360
   det_range: 100.0
 
   # FAST-LIO expects the LiDAR pose expressed in the IMU frame:
@@ -36,7 +34,7 @@ mapping:
 publish:
   path_en: true
   scan_publish_en: true
-  dense_publish_en: false
+  dense_publish_en: true
   scan_bodyframe_pub_en: true
   effect_publish_en: false
   map_publish_en: false

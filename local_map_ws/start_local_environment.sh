@@ -17,5 +17,4 @@ fi
 
 source "${WORKSPACE_DIR}/devel/setup.bash"
 
-exec roslaunch go2w_local_environment local_environment.launch "$@"
-
+exec roslaunch go2w_local_environment local_mapping_pipeline.launch "$@"

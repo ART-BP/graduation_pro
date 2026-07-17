@@ -2,14 +2,15 @@
   <arg name="rviz" default="true"/>
   <arg name="lidar_input_topic" default="/lidar_points"/>
   <arg name="feature_extract_enable" default="false"/>
-  <arg name="point_filter_num" default="2"/>
-  <arg name="max_iteration" default="4"/>
-  <arg name="filter_size_surf" default="0.1"/>
-  <arg name="filter_size_map" default="0.2"/>
+  <arg name="point_filter_num" default="3"/>
+  <arg name="max_iteration" default="3"/>
+  <arg name="filter_size_surf" default="0.5"/>
+  <arg name="filter_size_map" default="0.5"/>
+  <arg name="cube_side_length" default="1000.0"/>
   <arg name="acc_cov" default="0.1"/>
-  <arg name="gyr_cov" default="0.001"/>
+  <arg name="gyr_cov" default="0.0001"/>
   <arg name="b_acc_cov" default="0.0001"/>
-  <arg name="b_gyr_cov" default="0.000001"/>
+  <arg name="b_gyr_cov" default="0.0001"/>
   <arg name="extrinsic_est_en" default="false"/>
   <arg name="effect_publish_en" default="false"/>
   <arg name="map_publish_en" default="false"/>
@@ -27,7 +28,9 @@
   <param name="max_iteration" type="int" value="$(arg max_iteration)"/>
   <param name="filter_size_surf" type="double" value="$(arg filter_size_surf)"/>
   <param name="filter_size_map" type="double" value="$(arg filter_size_map)"/>
-  <param name="cube_side_length" type="double" value="200.0"/>
+  <param name="cube_side_length"
+         type="double"
+         value="$(arg cube_side_length)"/>
   <param name="runtime_pos_log_enable"
          type="bool"
          value="$(arg runtime_pos_log_enable)"/>

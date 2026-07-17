@@ -10,6 +10,7 @@ find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   pcl_conversions
   pcl_ros
+  rog_map
   roscpp
   sensor_msgs
 )
@@ -26,6 +27,7 @@ catkin_package(
     nav_msgs
     pcl_conversions
     pcl_ros
+    rog_map
     roscpp
     sensor_msgs
   DEPENDS PCL
@@ -40,16 +42,29 @@ include_directories(
 add_library(dual_layer_projector
   src/dual_layer_projector.cpp
 )
-target_link_libraries(dual_layer_projector
-  ${catkin_LIBRARIES}
-)
 
 add_executable(local_environment_node
   src/local_environment_node.cpp
 )
+add_dependencies(local_environment_node
+  ${catkin_EXPORTED_TARGETS}
+)
 target_link_libraries(local_environment_node
   dual_layer_projector
-  ${catkin_LIBRARIES}
+  ${grid_map_ros_LIBRARIES}
+  ${roscpp_LIBRARIES}
+  ${PCL_LIBRARIES}
+)
+
+add_executable(rog_map_node
+  src/rog_map_node.cpp
+)
+add_dependencies(rog_map_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(rog_map_node
+  ${rog_map_LIBRARIES}
+  ${roscpp_LIBRARIES}
   ${PCL_LIBRARIES}
 )
 
@@ -65,7 +80,7 @@ if(CATKIN_ENABLE_TESTING)
   endif()
 endif()
 
-install(TARGETS dual_layer_projector local_environment_node
+install(TARGETS dual_layer_projector local_environment_node rog_map_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -78,4 +93,3 @@ install(DIRECTORY include/${PROJECT_NAME}/
 install(DIRECTORY config launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
-
