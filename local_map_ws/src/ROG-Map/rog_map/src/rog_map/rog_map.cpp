@@ -23,6 +23,10 @@
 
 #include "rog_map/rog_map.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+
 using namespace rog_map;
 
 ROGMap::ROGMap(const ros::NodeHandle& nh) :nh_(nh) {
@@ -89,7 +93,7 @@ ROGMap::ROGMap(const ros::NodeHandle& nh) :nh_(nh) {
 
     writeMapInfoToLog(map_info_log_file_);
     map_info_log_file_.close();
-    for (int i = 0; i < time_consuming_name_.size(); i++) {
+    for (std::size_t i = 0; i < time_consuming_name_.size(); ++i) {
         time_log_file_ << time_consuming_name_[i];
         if (i != time_consuming_name_.size() - 1) {
             time_log_file_ << ", ";
@@ -108,7 +112,9 @@ ROGMap::ROGMap(const ros::NodeHandle& nh) :nh_(nh) {
         Pose cur_pose;
         cur_pose.first = Vec3f(0, 0, 0);
         updateOccPointCloud(*pcd_map);
-        esdf_map_->updateESDF3D(robot_state_.p);
+        if (cfg_.esdf_en) {
+            esdf_map_->updateESDF3D(robot_state_.p);
+        }
         cout << BLUE << " -- [ROGMap]Load pcd file success with " << pcd_map->size() << " pts." << RESET << endl;
         map_empty_ = false;
     }
@@ -116,6 +122,7 @@ ROGMap::ROGMap(const ros::NodeHandle& nh) :nh_(nh) {
 
 bool ROGMap::isLineFree(const rog_map::Vec3f& start_pt, const rog_map::Vec3f& end_pt,
                         const bool& use_inf_map, const bool& use_unk_as_occ) const {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
     if(start_pt.array().isNaN().any() || end_pt.array().isNaN().any() ) {
         cout<<RED<<" -- [ROGMap] Call isLineFree with NaN in start or end pt, return false."<<RESET<<endl;
         return false;
@@ -161,6 +168,7 @@ bool ROGMap::isLineFree(const rog_map::Vec3f& start_pt, const rog_map::Vec3f& en
 
 bool ROGMap::isLineFree(const Vec3f& start_pt, const Vec3f& end_pt, const double& max_dis,
                         const vec_Vec3i& neighbor_list) const {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
     raycaster::RayCaster raycaster;
     raycaster.setResolution(cfg_.resolution);
     Vec3f ray_pt;
@@ -191,6 +199,7 @@ bool ROGMap::isLineFree(const Vec3f& start_pt, const Vec3f& end_pt, const double
 
 bool ROGMap::isLineFree(const Vec3f& start_pt, const Vec3f& end_pt, Vec3f& free_local_goal, const double& max_dis,
                         const vec_Vec3i& neighbor_list) const {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
     raycaster::RayCaster raycaster;
     raycaster.setResolution(cfg_.resolution);
     Vec3f ray_pt;
@@ -239,23 +248,126 @@ void ROGMap::updateMap(const PointCloud& cloud, const Pose& pose) {
         return;
     }
 
-    updateRobotState(pose);
-    updateProbMap(cloud, pose);
+    Pose normalized_pose = pose;
+    if (normalized_pose.second.norm() > 1e-9) {
+        normalized_pose.second.normalize();
+    } else {
+        normalized_pose.second = Quatf::Identity();
+    }
+    updateRobotState(normalized_pose, ros::Time::now());
+    const Vec3f sensor_origin = sensorOriginFromBodyPose(normalized_pose);
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
+    updateProbMap(cloud, normalized_pose, sensor_origin);
 
     writeTimeConsumingToLog(time_log_file_);
 }
 
 RobotState ROGMap::getRobotState() const {
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
     return robot_state_;
 }
 
-void ROGMap::updateRobotState(const Pose& pose) {
+void ROGMap::updateRobotState(const Pose& input_pose, const ros::Time& input_stamp) {
+    Pose pose = input_pose;
+    if (pose.second.norm() > 1e-9) {
+        pose.second.normalize();
+    } else {
+        pose.second = Quatf::Identity();
+    }
+    const ros::Time stamp = input_stamp.isZero() ? ros::Time::now() : input_stamp;
+
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
     robot_state_.p = pose.first;
     robot_state_.q = pose.second;
     robot_state_.rcv_time = ros::Time::now().toSec();
     robot_state_.rcv = true;
     robot_state_.yaw = get_yaw_from_quaternion<double>(pose.second);
-    updateLocalBox(pose.first);
+
+    const auto insertion_point = std::lower_bound(
+            odom_history_.begin(), odom_history_.end(), stamp,
+            [](const TimedPose& sample, const ros::Time& value) {
+                return sample.stamp < value;
+            });
+    if (insertion_point != odom_history_.end() && insertion_point->stamp == stamp) {
+        insertion_point->pose = pose;
+    } else {
+        odom_history_.insert(insertion_point, TimedPose{stamp, pose});
+    }
+
+    const ros::Time newest_stamp = odom_history_.back().stamp;
+    while (!odom_history_.empty() &&
+           (newest_stamp - odom_history_.front().stamp).toSec() >
+                   cfg_.odom_history_duration) {
+        odom_history_.pop_front();
+    }
+}
+
+bool ROGMap::findPoseAt(const ros::Time& stamp, Pose& pose) const {
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    if (!robot_state_.rcv || odom_history_.empty() ||
+        ros::Time::now().toSec() - robot_state_.rcv_time > cfg_.odom_timeout) {
+        return false;
+    }
+
+    if (stamp.isZero()) {
+        pose = odom_history_.back().pose;
+        return true;
+    }
+
+    const auto after = std::lower_bound(
+            odom_history_.begin(), odom_history_.end(), stamp,
+            [](const TimedPose& sample, const ros::Time& value) {
+                return sample.stamp < value;
+            });
+
+    if (after == odom_history_.begin()) {
+        if (std::abs((after->stamp - stamp).toSec()) > cfg_.pose_sync_tolerance) {
+            return false;
+        }
+        pose = after->pose;
+        return true;
+    }
+    if (after == odom_history_.end()) {
+        const TimedPose& latest = odom_history_.back();
+        if (std::abs((stamp - latest.stamp).toSec()) > cfg_.pose_sync_tolerance) {
+            return false;
+        }
+        pose = latest.pose;
+        return true;
+    }
+    if (after->stamp == stamp) {
+        pose = after->pose;
+        return true;
+    }
+
+    const TimedPose& before = *std::prev(after);
+    const double interval = (after->stamp - before.stamp).toSec();
+    const double before_distance = (stamp - before.stamp).toSec();
+    const double after_distance = (after->stamp - stamp).toSec();
+    if (interval > 0.0 && before_distance <= cfg_.pose_sync_tolerance &&
+        after_distance <= cfg_.pose_sync_tolerance) {
+        const double ratio = before_distance / interval;
+        pose.first = before.pose.first + ratio * (after->pose.first - before.pose.first);
+        pose.second = before.pose.second.slerp(ratio, after->pose.second).normalized();
+        return true;
+    }
+
+    const TimedPose& nearest = before_distance <= after_distance ? before : *after;
+    if (std::min(before_distance, after_distance) > cfg_.pose_sync_tolerance) {
+        return false;
+    }
+    pose = nearest.pose;
+    return true;
+}
+
+Vec3f ROGMap::sensorOriginFromBodyPose(const Pose& body_pose) const {
+    Quatf orientation = body_pose.second;
+    if (orientation.norm() > 1e-9) {
+        orientation.normalize();
+    } else {
+        orientation = Quatf::Identity();
+    }
+    return body_pose.first + orientation * cfg_.sensor_origin_in_body;
 }
 
 
@@ -264,14 +376,20 @@ void ROGMap::odomCallback(const nav_msgs::OdometryConstPtr& odom_msg) {
         Vec3f(odom_msg->pose.pose.position.x, odom_msg->pose.pose.position.y,
               odom_msg->pose.pose.position.z),
         Quatf(odom_msg->pose.pose.orientation.w, odom_msg->pose.pose.orientation.x,
-              odom_msg->pose.pose.orientation.y, odom_msg->pose.pose.orientation.z)));
+              odom_msg->pose.pose.orientation.y, odom_msg->pose.pose.orientation.z)),
+        odom_msg->header.stamp);
 
+
+    if (!cfg_.publish_tf) {
+        return;
+    }
 
     static tf2_ros::TransformBroadcaster br_map_ego;
     geometry_msgs::TransformStamped transformStamped;
-    transformStamped.header.stamp = ros::Time::now();
+    transformStamped.header.stamp =
+            odom_msg->header.stamp.isZero() ? ros::Time::now() : odom_msg->header.stamp;
     transformStamped.header.frame_id = cfg_.frame_id;
-    transformStamped.child_frame_id = "drone";
+    transformStamped.child_frame_id = cfg_.body_frame_id;
     transformStamped.transform.translation.x = odom_msg->pose.pose.position.x;
     transformStamped.transform.translation.y = odom_msg->pose.pose.position.y;
     transformStamped.transform.translation.z = odom_msg->pose.pose.position.z;
@@ -283,26 +401,31 @@ void ROGMap::odomCallback(const nav_msgs::OdometryConstPtr& odom_msg) {
 }
 
 void ROGMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
-    if (!robot_state_.rcv) {
-        return;
-    }
-    double cbk_t = ros::Time::now().toSec();
-    if (cbk_t - robot_state_.rcv_time > cfg_.odom_timeout) {
-        std::cout << YELLOW << " -- [ROS] Odom timeout, skip cloud callback." << RESET << std::endl;
-        return;
-    }
-    PointCloud temp_pc;
-    pcl::fromROSMsg(*cloud_msg, temp_pc);
-    rc_.updete_lock.lock();
+    PointCloud::Ptr temp_pc(new PointCloud);
+    pcl::fromROSMsg(*cloud_msg, *temp_pc);
+    std::lock_guard<std::mutex> update_lock(rc_.update_lock);
     rc_.pc = temp_pc;
-    rc_.pc_pose = std::make_pair(robot_state_.p, robot_state_.q);
+    rc_.pc_stamp = cloud_msg->header.stamp;
+    rc_.pc_received = ros::WallTime::now();
     rc_.unfinished_frame_cnt++;
-    map_empty_ = false;
-    rc_.updete_lock.unlock();
 }
 
 void ROGMap::updateCallback(const ros::TimerEvent& event) {
-    if (map_empty_) {
+    ros::Time cloud_stamp;
+    ros::WallTime cloud_received;
+    int pending_frames = 0;
+    {
+        std::lock_guard<std::mutex> update_lock(rc_.update_lock);
+        pending_frames = rc_.unfinished_frame_cnt;
+        cloud_stamp = rc_.pc_stamp;
+        cloud_received = rc_.pc_received;
+    }
+
+    if (pending_frames == 0) {
+        std::lock_guard<std::mutex> map_lock(map_mutex_);
+        if (!map_empty_) {
+            return;
+        }
         static double last_print_t = ros::Time::now().toSec();
         double cur_t = ros::Time::now().toSec();
         if (cfg_.ros_callback_en && (cur_t - last_print_t > 1.0)) {
@@ -311,133 +434,246 @@ void ROGMap::updateCallback(const ros::TimerEvent& event) {
         }
         return;
     }
-    if (rc_.unfinished_frame_cnt == 0) {
+
+    Pose synchronized_pose;
+    if (!findPoseAt(cloud_stamp, synchronized_pose)) {
+        if (!cloud_received.isZero() &&
+            (ros::WallTime::now() - cloud_received).toSec() > cfg_.odom_timeout) {
+            std::lock_guard<std::mutex> update_lock(rc_.update_lock);
+            if (rc_.pc_stamp == cloud_stamp) {
+                rc_.unfinished_frame_cnt = 0;
+            }
+            ROS_WARN_THROTTLE(
+                    1.0,
+                    "Dropping point cloud: no odometry within pose_sync_tolerance.");
+        }
         return;
     }
-    else if (rc_.unfinished_frame_cnt > 1) {
-        std::cout << RED <<
-            " -- [ROG WARN] Unfinished frame cnt > 1, the map may not work in real-time" << RESET
-            << std::endl;
-    }
-    static PointCloud temp_pc;
-    static Pose temp_pose;
-    rc_.updete_lock.lock();
-    temp_pc = rc_.pc;
-    temp_pose = rc_.pc_pose;
-    rc_.unfinished_frame_cnt = 0;
-    rc_.updete_lock.unlock();
 
-    updateProbMap(temp_pc, temp_pose);
+    if (pending_frames > 1) {
+        ROS_WARN_THROTTLE(
+                1.0,
+                "ROG-Map dropped intermediate point clouds: %d frames arrived "
+                "before the latest frame was consumed.",
+                pending_frames);
+    }
+
+    PointCloud::ConstPtr temp_pc;
+    {
+        std::lock_guard<std::mutex> update_lock(rc_.update_lock);
+        if (rc_.pc_stamp != cloud_stamp) {
+            return;
+        }
+        temp_pc = rc_.pc;
+        rc_.unfinished_frame_cnt = 0;
+    }
+
+    const Vec3f sensor_origin = sensorOriginFromBodyPose(synchronized_pose);
+    if (!temp_pc) {
+        return;
+    }
+    const auto lock_request = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> map_lock(map_mutex_);
+    const auto lock_acquired = std::chrono::steady_clock::now();
+    updateProbMap(*temp_pc, synchronized_pose, sensor_origin);
+    const auto update_finished = std::chrono::steady_clock::now();
+    map_lock.unlock();
+
+    const double lock_wait_ms =
+            std::chrono::duration<double, std::milli>(
+                    lock_acquired - lock_request).count();
+    const double update_ms =
+            std::chrono::duration<double, std::milli>(
+                    update_finished - lock_acquired).count();
+    if (lock_wait_ms + update_ms > 80.0) {
+        ROS_WARN_THROTTLE(
+                1.0,
+                "ROG-Map slow frame: total=%.1f ms, map_lock=%.1f ms, "
+                "core=%.1f ms, raycast=%.1f ms, cache=%.1f ms, points=%zu.",
+                lock_wait_ms + update_ms,
+                lock_wait_ms,
+                update_ms,
+                1000.0 * time_consuming_[1],
+                1000.0 * time_consuming_[2],
+                temp_pc->size());
+    }
 
     writeTimeConsumingToLog(time_log_file_);
 }
 
 void ROGMap::vecEVec3fToPC2(const vec_E<Vec3f>& points, sensor_msgs::PointCloud2& cloud) const {
-    // 设置header信息
-    pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
-    pcl_cloud.resize(points.size());
-    for (long unsigned int i = 0; i < points.size(); i++) {
-        pcl_cloud[i].x = static_cast<float>(points[i][0]);
-        pcl_cloud[i].y = static_cast<float>(points[i][1]);
-        pcl_cloud[i].z = static_cast<float>(points[i][2]);
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2FieldsByString(1, "xyz");
+    modifier.resize(points.size());
+    sensor_msgs::PointCloud2Iterator<float> x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> z(cloud, "z");
+    for (const Vec3f& point : points) {
+        *x = static_cast<float>(point.x());
+        *y = static_cast<float>(point.y());
+        *z = static_cast<float>(point.z());
+        ++x;
+        ++y;
+        ++z;
     }
-    pcl::toROSMsg(pcl_cloud, cloud);
+    cloud.is_dense = true;
     cloud.header.stamp = ros::Time::now();
     cloud.header.frame_id = cfg_.frame_id;
 }
 
 void ROGMap::vizCallback(const ros::TimerEvent& event) {
-    TimeConsuming ssss("vizCallback", false);
-
     if (!cfg_.visualization_en) {
         return;
     }
-    if (map_empty_) {
+    std::unique_lock<std::mutex> callback_lock(
+            vm_.callback_mutex, std::try_to_lock);
+    if (!callback_lock.owns_lock()) {
         return;
     }
-    Vec3f box_min, box_max;
 
-    // if use dynamic reconfigure
+    const RobotState robot_state = getRobotState();
+    const bool publish_unknown = cfg_.pub_unknown_map_en &&
+            vm_.unknown_pub.getNumSubscribers() > 0;
+    const bool publish_occupied = vm_.occ_pub.getNumSubscribers() > 0;
+    const bool publish_unknown_inflated = publish_unknown &&
+            cfg_.unk_inflation_en &&
+            vm_.unknown_inf_pub.getNumSubscribers() > 0;
+    const bool publish_occupied_inflated =
+            vm_.occ_inf_pub.getNumSubscribers() > 0;
+    const bool publish_frontier = cfg_.frontier_extraction_en &&
+            vm_.frontier_pub.getNumSubscribers() > 0;
+    const bool publish_esdf_positive = cfg_.esdf_en &&
+            vm_.esdf_pub.getNumSubscribers() > 0;
+    const bool publish_esdf_negative = cfg_.esdf_en &&
+            vm_.esdf_neg_pub.getNumSubscribers() > 0;
+
+    Vec3f box_min, box_max;
     if (cfg_.use_dynamic_reconfigure) {
         box_min = vm_.vizcfg.box_min;
         box_max = vm_.vizcfg.box_max;
-
-        // if use body center
         if (vm_.vizcfg.use_body_center) {
-            box_min += robot_state_.p;
-            box_max += robot_state_.p;
+            box_min += robot_state.p;
+            box_max += robot_state.p;
+        }
+    } else {
+        box_max = robot_state.p + cfg_.visualization_range / 2;
+        box_min = robot_state.p - cfg_.visualization_range / 2;
+    }
+
+    Vec3f local_map_min, local_map_max, local_map_origin;
+    Vec3f update_box_min, update_box_max;
+    Vec3f esdf_box_min, esdf_box_max;
+    sensor_msgs::PointCloud2 esdf_positive_msg, esdf_negative_msg;
+#ifdef ESDF_MAP_DEBUG
+    const bool publish_esdf_occupied = cfg_.esdf_en &&
+            vm_.esdf_occ_pub.getNumSubscribers() > 0;
+    sensor_msgs::PointCloud2 esdf_occupied_msg;
+#endif
+    {
+        std::lock_guard<std::mutex> map_lock(map_mutex_);
+        if (map_empty_) {
+            return;
+        }
+        boundBoxByLocalMap(box_min, box_max);
+        if ((box_max - box_min).minCoeff() <= 0) {
+            ROS_WARN_THROTTLE(1.0, "ROG-Map visualization range is outside the local map.");
+            return;
+        }
+
+        if (publish_occupied || publish_unknown) {
+            // Copy only the compact probability buffer while holding the map
+            // lock. Classification, point generation, serialization and ROS
+            // publication happen after the update thread is unblocked.
+            copyProbabilityBox(
+                    box_min, box_max, vm_.probability_snapshot);
+        }
+        if (publish_unknown_inflated) {
+            boxSearchInflate(
+                    box_min, box_max, UNKNOWN,
+                    vm_.unknown_inflated_points);
+        }
+        if (publish_occupied_inflated) {
+            boxSearchInflate(
+                    box_min, box_max, OCCUPIED,
+                    vm_.occupied_inflated_points);
+        }
+        if (publish_frontier) {
+            boxSearch(box_min, box_max, FRONTIER, vm_.frontier_points);
+        }
+        if (publish_esdf_positive) {
+            esdf_map_->getPositiveESDFPC2(
+                    box_min, box_max, robot_state.p.z() - 0.5,
+                    esdf_positive_msg);
+        }
+        if (publish_esdf_negative) {
+            esdf_map_->getNegativeESDFPC2(
+                    box_min, box_max, robot_state.p.z() - 0.5,
+                    esdf_negative_msg);
+        }
+#ifdef ESDF_MAP_DEBUG
+        if (publish_esdf_occupied) {
+            esdf_map_->getESDFOccPC2(
+                    box_min, box_max, esdf_occupied_msg);
+        }
+#endif
+
+        local_map_min = local_map_bound_min_d_;
+        local_map_max = local_map_bound_max_d_;
+        local_map_origin = local_map_origin_d_;
+        update_box_min = raycast_data_.cache_box_min;
+        update_box_max = raycast_data_.cache_box_max;
+        if (cfg_.esdf_en) {
+            esdf_map_->getUpdatedBbox(esdf_box_min, esdf_box_max);
         }
     }
-    else {
-        box_max = robot_state_.p + cfg_.visualization_range / 2;
-        box_min = robot_state_.p - cfg_.visualization_range / 2;
-    }
-    boundBoxByLocalMap(box_min, box_max);
-    if ((box_max - box_min).minCoeff() <= 0) {
-        cout << RED << " -- [ROGMap] Visualization range is too small." << RESET << endl;
-        return;
+
+    if (publish_occupied || publish_unknown) {
+        probabilityBoxSnapshotToPoints(
+                vm_.probability_snapshot,
+                vm_.occupied_points, vm_.unknown_points);
     }
 
-    if (cfg_.pub_unknown_map_en && vm_.unknown_pub.getNumSubscribers() >= 1) {
-        vec_E<Vec3f> unknown_map, inf_unknown_map;
-        boxSearch(box_min, box_max, UNKNOWN, unknown_map);
-        sensor_msgs::PointCloud2 cloud_msg;
-        vecEVec3fToPC2(unknown_map, cloud_msg);
-        cloud_msg.header.stamp = ros::Time::now();
-        vm_.unknown_pub.publish(cloud_msg);
-        if (cfg_.unk_inflation_en && vm_.unknown_inf_pub.getNumSubscribers() >= 1) {
-            boxSearchInflate(box_min, box_max, UNKNOWN, inf_unknown_map);
-            vecEVec3fToPC2(inf_unknown_map, cloud_msg);
-            cloud_msg.header.stamp = ros::Time::now();
-            vm_.unknown_inf_pub.publish(cloud_msg);
-        }
-    }
-
-    if (cfg_.frontier_extraction_en && vm_.frontier_pub.getNumSubscribers() >= 1) {
-        vec_E<Vec3f> frontier_map;
-        boxSearch(box_min, box_max, FRONTIER, frontier_map);
-        sensor_msgs::PointCloud2 cloud_msg;
-        vecEVec3fToPC2(frontier_map, cloud_msg);
-        cloud_msg.header.stamp = ros::Time::now();
-        vm_.frontier_pub.publish(cloud_msg);
-    }
-
-    vec_E<Vec3f> occ_map, inf_occ_map;
+    const ros::Time stamp = ros::Time::now();
     sensor_msgs::PointCloud2 cloud_msg;
-    if (vm_.occ_pub.getNumSubscribers() >= 1) {
-        boxSearch(box_min, box_max, OCCUPIED, occ_map);
-        vecEVec3fToPC2(occ_map, cloud_msg);
+    if (publish_unknown) {
+        vecEVec3fToPC2(vm_.unknown_points, cloud_msg);
+        cloud_msg.header.stamp = stamp;
+        vm_.unknown_pub.publish(cloud_msg);
+    }
+    if (publish_occupied) {
+        vecEVec3fToPC2(vm_.occupied_points, cloud_msg);
+        cloud_msg.header.stamp = stamp;
         vm_.occ_pub.publish(cloud_msg);
     }
-
-    if (vm_.occ_inf_pub.getNumSubscribers() >= 1) {
-        boxSearchInflate(box_min, box_max, OCCUPIED, inf_occ_map);
-        vecEVec3fToPC2(inf_occ_map, cloud_msg);
-        cloud_msg.header.stamp = ros::Time::now();
+    if (publish_unknown_inflated) {
+        vecEVec3fToPC2(vm_.unknown_inflated_points, cloud_msg);
+        cloud_msg.header.stamp = stamp;
+        vm_.unknown_inf_pub.publish(cloud_msg);
+    }
+    if (publish_occupied_inflated) {
+        vecEVec3fToPC2(vm_.occupied_inflated_points, cloud_msg);
+        cloud_msg.header.stamp = stamp;
         vm_.occ_inf_pub.publish(cloud_msg);
     }
-
-    /* visualize ESDF Map*/
-    if (cfg_.esdf_en) {
-        if (vm_.esdf_pub.getNumSubscribers() >= 1) {
-            esdf_map_->getPositiveESDFPC2(box_min, box_max, robot_state_.p.z() - 0.5, cloud_msg);
-            cloud_msg.header.stamp = ros::Time::now();
-            vm_.esdf_pub.publish(cloud_msg);
-        }
-
-        if (vm_.esdf_neg_pub.getNumSubscribers() >= 1) {
-            esdf_map_->getNegativeESDFPC2(box_min, box_max, robot_state_.p.z() - 0.5, cloud_msg);
-            cloud_msg.header.stamp = ros::Time::now();
-            vm_.esdf_neg_pub.publish(cloud_msg);
-        }
-
-#ifdef ESDF_MAP_DEBUG
-        esdf_map_->getESDFOccPC2(box_min, box_max,cloud_msg);
-        cloud_msg.header.stamp = ros::Time::now();
-        vm_.esdf_occ_pub.publish(cloud_msg);
-#endif
+    if (publish_frontier) {
+        vecEVec3fToPC2(vm_.frontier_points, cloud_msg);
+        cloud_msg.header.stamp = stamp;
+        vm_.frontier_pub.publish(cloud_msg);
     }
-
+    if (publish_esdf_positive) {
+        esdf_positive_msg.header.stamp = stamp;
+        vm_.esdf_pub.publish(esdf_positive_msg);
+    }
+    if (publish_esdf_negative) {
+        esdf_negative_msg.header.stamp = stamp;
+        vm_.esdf_neg_pub.publish(esdf_negative_msg);
+    }
+#ifdef ESDF_MAP_DEBUG
+    if (publish_esdf_occupied) {
+        esdf_occupied_msg.header.stamp = stamp;
+        vm_.esdf_occ_pub.publish(esdf_occupied_msg);
+    }
+#endif
 
     /* Publish visualization range */
     vm_.mkr_arr.markers.clear();
@@ -446,8 +682,6 @@ void ROGMap::vizCallback(const ros::TimerEvent& event) {
                   Color::Purple(), 0.6, 0);
 
     /* Publish local map range */
-    Vec3f local_map_max(999, 999, 999), local_map_min(-999, -999, -999);
-    boundBoxByLocalMap(local_map_min, local_map_max);
     visualizeBoundingBox(vm_.mkr_arr, local_map_min, local_map_max, "Local Map Range",
                          Color::Orange());
     visualizeText(vm_.mkr_arr, "Local Map Range Text", "Local Map Range", local_map_max + Vec3f(0, 0, 1.0),
@@ -455,19 +689,17 @@ void ROGMap::vizCallback(const ros::TimerEvent& event) {
                   0.6, 0);
 
     /* Publish Ray-casting range */
-    visualizeBoundingBox(vm_.mkr_arr, raycast_data_.cache_box_min, raycast_data_.cache_box_max,
+    visualizeBoundingBox(vm_.mkr_arr, update_box_min, update_box_max,
                          "Updating Range",
                          Color::Green());
     visualizeText(vm_.mkr_arr, "Updating Range Text", "Updating Range",
-                  raycast_data_.cache_box_max + Vec3f(0, 0, 0.5),
+                  update_box_max + Vec3f(0, 0, 0.5),
                   Color::Green(), 0.6, 0);
 
     /* Publish Local map origin */
-    visualizePoint(vm_.mkr_arr, local_map_origin_d_, Color::Red(), "Local Map Origin", 0.2, 0);
+    visualizePoint(vm_.mkr_arr, local_map_origin, Color::Red(), "Local Map Origin", 0.2, 0);
 
     if (cfg_.esdf_en) {
-        Vec3f esdf_box_max, esdf_box_min;
-        esdf_map_->getUpdatedBbox(esdf_box_min, esdf_box_max);
         visualizeText(vm_.mkr_arr, "ESDF Map Text", "ESDF Map", esdf_box_max + Vec3f(0, 0, 1.0),
                       Color::Blue(),
                       0.6, 0);
@@ -480,6 +712,7 @@ void ROGMap::vizCallback(const ros::TimerEvent& event) {
 }
 
 void ROGMap::VizCfgCallback(rog_map::VizConfig& config, uint32_t level) {
+    std::lock_guard<std::mutex> callback_lock(vm_.callback_mutex);
     vm_.vizcfg.use_body_center = config.use_body_center;
     vm_.vizcfg.box_min.x() = config.x_lower_bound;
     vm_.vizcfg.box_min.y() = config.y_lower_bound;

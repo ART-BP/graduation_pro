@@ -29,7 +29,7 @@ namespace rog_map {
     using std::string;
     using std::vector;
 #define RM_UNKNOWN_FLAG (-99999)
-    typedef pcl::PointXYZINormal PclPoint;
+    typedef pcl::PointXYZI PclPoint;
     typedef pcl::PointCloud<PclPoint> PointCloud;
 
 
@@ -125,6 +125,21 @@ namespace rog_map {
             LoadParam(name_space + "/ros_callback/cloud_topic", cloud_topic, string("/cloud_registered"));
             LoadParam(name_space + "/ros_callback/odom_topic", odom_topic, string("/lidar_slam/odom"));
             LoadParam(name_space + "/ros_callback/odom_timeout", odom_timeout, 0.05);
+            LoadParam(name_space + "/ros_callback/pose_sync_tolerance", pose_sync_tolerance, 0.05);
+            LoadParam(name_space + "/ros_callback/odom_history_duration", odom_history_duration, 2.0);
+            LoadParam(name_space + "/ros_callback/publish_tf", publish_tf, false);
+            LoadParam(name_space + "/ros_callback/body_frame_id", body_frame_id, string("base_link"));
+            vector<double> temp_sensor_origin;
+            LoadParam(name_space + "/ros_callback/sensor_origin_in_body", temp_sensor_origin,
+                      vector<double>{0.0, 0.0, 0.0});
+            if (temp_sensor_origin.size() != 3) {
+                throw std::invalid_argument("sensor_origin_in_body must contain exactly 3 values");
+            }
+            sensor_origin_in_body = Vec3f(temp_sensor_origin[0], temp_sensor_origin[1], temp_sensor_origin[2]);
+            if (odom_timeout <= 0.0 || pose_sync_tolerance < 0.0 || odom_history_duration <= 0.0) {
+                throw std::invalid_argument(
+                        "odom_timeout and odom_history_duration must be positive, and pose_sync_tolerance non-negative");
+            }
 
 
             LoadParam(name_space + "/visualization/enable", visualization_en, false);
@@ -183,6 +198,22 @@ namespace rog_map {
                 point_filt_num = 1;
             }
 
+            LoadParam(name_space + "/self_filter/enable", self_filter_en, false);
+            vector<double> temp_self_filter_min;
+            vector<double> temp_self_filter_max;
+            LoadParam(name_space + "/self_filter/min", temp_self_filter_min,
+                      vector<double>{-0.45, -0.30, -0.35});
+            LoadParam(name_space + "/self_filter/max", temp_self_filter_max,
+                      vector<double>{0.45, 0.30, 0.30});
+            if (temp_self_filter_min.size() != 3 || temp_self_filter_max.size() != 3) {
+                throw std::invalid_argument("self_filter min/max must each contain exactly 3 values");
+            }
+            self_filter_min = Vec3f(temp_self_filter_min[0], temp_self_filter_min[1], temp_self_filter_min[2]);
+            self_filter_max = Vec3f(temp_self_filter_max[0], temp_self_filter_max[1], temp_self_filter_max[2]);
+            if ((self_filter_max - self_filter_min).minCoeff() <= 0.0) {
+                throw std::invalid_argument("self_filter max must be greater than min on every axis");
+            }
+
 
             // raycasting
             LoadParam(name_space + "/raycasting/enable", raycasting_en, true);
@@ -192,6 +223,12 @@ namespace rog_map {
                           << RESET << std::endl;
                 batch_update_size = 1;
             }
+            LoadParam(name_space + "/raycasting/max_hit_updates_per_batch", max_hit_updates_per_batch, 1);
+            LoadParam(name_space + "/raycasting/max_miss_updates_per_batch", max_miss_updates_per_batch, 1);
+            if (max_hit_updates_per_batch <= 0 || max_miss_updates_per_batch <= 0 ||
+                max_hit_updates_per_batch > 65535 || max_miss_updates_per_batch > 65535) {
+                throw std::invalid_argument("per-batch hit/miss update limits must be in [1, 65535]");
+            }
             LoadParam(name_space + "/raycasting/unk_thresh", unk_thresh, 0.70);
             LoadParam(name_space + "/raycasting/p_hit", p_hit, 0.70f);
             LoadParam(name_space + "/raycasting/p_miss", p_miss, 0.70f);
@@ -199,7 +236,14 @@ namespace rog_map {
             LoadParam(name_space + "/raycasting/p_max", p_max, 0.97f);
             LoadParam(name_space + "/raycasting/p_occ", p_occ, 0.80f);
             LoadParam(name_space + "/raycasting/p_free", p_free, 0.30f);
-            LoadParam(name_space + "/raycasting/p_free", p_free, 0.30f);
+            if (!(0.0F < p_min && p_min < p_free && p_free < 0.5F &&
+                  0.0F < p_miss && p_miss < 0.5F &&
+                  0.5F < p_hit && p_hit < 1.0F &&
+                  0.5F < p_occ && p_occ < p_max && p_max < 1.0F)) {
+                throw std::invalid_argument(
+                        "invalid occupancy probabilities: require p_min < p_free < 0.5, "
+                        "p_miss < 0.5, and 0.5 < p_occ < p_max with p_hit > 0.5");
+            }
 
             vector<double> temp_ray_range;
             LoadParam(name_space + "/raycasting/ray_range", temp_ray_range, vector<double>{0.3, 10});
@@ -302,6 +346,7 @@ namespace rog_map {
 
         bool visualization_en{false}, frontier_extraction_en{false},
                 raycasting_en{true}, ros_callback_en{false}, pub_unknown_map_en{false};
+        bool publish_tf{false};
 
         std::vector<Vec3i> spherical_neighbor;
         std::vector<Vec3i> unk_spherical_neighbor;
@@ -310,15 +355,22 @@ namespace rog_map {
         int intensity_thresh;
         /* aster properties */
         string frame_id;
+        string body_frame_id;
         bool map_sliding_en{true};
         Vec3f fix_map_origin;
         string odom_topic, cloud_topic;
+        Vec3f sensor_origin_in_body;
+        double pose_sync_tolerance, odom_history_duration;
         /* probability update */
         double raycast_range_min, raycast_range_max;
         double sqr_raycast_range_min, sqr_raycast_range_max;
         int point_filt_num, batch_update_size;
+        int max_hit_updates_per_batch, max_miss_updates_per_batch;
         float p_hit, p_miss, p_min, p_max, p_occ, p_free;
         float l_hit, l_miss, l_min, l_max, l_occ, l_free;
+
+        bool self_filter_en{false};
+        Vec3f self_filter_min, self_filter_max;
 
         /* for unknown inflation */
         bool unk_inflation_en{false};

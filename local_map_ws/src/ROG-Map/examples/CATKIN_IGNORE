@@ -1,2 +1,0 @@
-# The upstream simulation and planning examples require additional packages.
-# Only the core rog_map package is part of the Go2W local-map workspace.

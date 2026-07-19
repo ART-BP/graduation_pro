@@ -22,6 +22,8 @@
 */
 
 #include <rog_map/prob_map.h>
+
+#include <cmath>
 using namespace rog_map;
 
 void ProbMap::initProbMap() {
@@ -79,6 +81,7 @@ void ProbMap::initProbMap() {
     raycast_data_.raycaster.setResolution(cfg_.resolution);
     raycast_data_.operation_cnt.resize(map_size, 0);
     raycast_data_.hit_cnt.resize(map_size, 0);
+    raycast_data_.endpoint_seen_epoch.resize(map_size, 0);
 
     resetLocalMap();
 
@@ -300,14 +303,18 @@ void ProbMap::slideAllMap(const rog_map::Vec3f& pos) {
 }
 
 void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
+    updateProbMap(cloud, pose, pose.first);
+}
+
+void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& body_pose,
+                            const Vec3f& sensor_origin) {
     TimeConsuming tc("updateMap", false);
-    const Vec3f& pos = pose.first;
+    const Vec3f& pos = body_pose.first;
     time_consuming_[4] = cloud.size();
     if (cfg_.map_sliding_en && !insideLocalMap(pos) && raycast_data_.batch_update_counter == 0) {
         cout << YELLOW << " -- [ROGMapCore] cur_pose out of map range, reset the map." << RESET << endl;
         cout << YELLOW << " -- [ROGMapCore] Sliding to map center at: " << pos.transpose() << RESET << endl;
         slideAllMap(pos);
-        return;
     }
 
     if (pos.z() > cfg_.virtual_ceil_height) {
@@ -329,7 +336,7 @@ void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
 
     updateLocalBox(pos);
     TimeConsuming t_raycast("raycast", false);
-    raycastProcess(cloud, pos);
+    raycastProcess(cloud, body_pose, sensor_origin);
     time_consuming_[1] = t_raycast.stop();
     raycast_data_.batch_update_counter++;
     if (raycast_data_.batch_update_counter >= cfg_.batch_update_size) {
@@ -359,7 +366,12 @@ void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
                     if (p.norm() <= cfg_.raycast_range_min) {
                         Vec3f pp = pos + p;
                         int hash_id = getHashIndexFromPos(pp);
-                        missPointUpdate(pp, hash_id, 999);
+                        const int required_misses = std::max(
+                                1,
+                                static_cast<int>(std::ceil(cfg_.l_free / cfg_.l_miss)));
+                        for (int miss = 0; miss < required_misses; ++miss) {
+                            missPointUpdate(pp, hash_id, 1);
+                        }
                     }
                 }
             }
@@ -485,6 +497,138 @@ ProbMap::boxSearch(const Vec3f& _box_min, const Vec3f& _box_max, const GridType&
     }
 }
 
+void ProbMap::boxSearchOccupiedAndUnknown(
+        const Vec3f& _box_min, const Vec3f& _box_max,
+        vec_E<Vec3f>& occupied_points,
+        vec_E<Vec3f>& unknown_points) const {
+    occupied_points.clear();
+    unknown_points.clear();
+    if (map_empty_ || (_box_max - _box_min).minCoeff() <= 0) {
+        return;
+    }
+
+    Vec3f box_min_d = _box_min;
+    Vec3f box_max_d = _box_max;
+    boundBoxByLocalMap(box_min_d, box_max_d);
+    if ((box_max_d - box_min_d).minCoeff() <= 0) {
+        return;
+    }
+
+    Vec3i box_min_id_g, box_max_id_g;
+    posToGlobalIndex(box_min_d, box_min_id_g);
+    posToGlobalIndex(box_max_d, box_max_id_g);
+    const Vec3i box_size = box_max_id_g - box_min_id_g;
+    const std::size_t voxel_count =
+            static_cast<std::size_t>(std::max(0, box_size.x())) *
+            static_cast<std::size_t>(std::max(0, box_size.y())) *
+            static_cast<std::size_t>(std::max(0, box_size.z()));
+    if (unknown_points.capacity() < voxel_count) {
+        unknown_points.reserve(voxel_count);
+    }
+    if (occupied_points.capacity() < voxel_count / 8U) {
+        occupied_points.reserve(voxel_count / 8U);
+    }
+
+    for (int x = box_min_id_g.x() + 1; x < box_max_id_g.x(); ++x) {
+        for (int y = box_min_id_g.y() + 1; y < box_max_id_g.y(); ++y) {
+            for (int z = box_min_id_g.z() + 1; z < box_max_id_g.z(); ++z) {
+                const Vec3i id_g(x, y, z);
+                const float value =
+                        occupancy_buffer_[getHashIndexFromGlobalIndex(id_g)];
+                if (!isOccupied(value) && !isUnknown(value)) {
+                    continue;
+                }
+                Vec3f pos;
+                globalIndexToPos(id_g, pos);
+                if (isOccupied(value)) {
+                    occupied_points.push_back(pos);
+                } else {
+                    unknown_points.push_back(pos);
+                }
+            }
+        }
+    }
+}
+
+void ProbMap::copyProbabilityBox(
+        const Vec3f& _box_min, const Vec3f& _box_max,
+        ProbabilityBoxSnapshot& snapshot) const {
+    snapshot.values.clear();
+    if (map_empty_ || (_box_max - _box_min).minCoeff() <= 0) {
+        return;
+    }
+
+    Vec3f box_min = _box_min;
+    Vec3f box_max = _box_max;
+    boundBoxByLocalMap(box_min, box_max);
+    if ((box_max - box_min).minCoeff() <= 0) {
+        return;
+    }
+
+    posToGlobalIndex(box_min, snapshot.minimum_index);
+    posToGlobalIndex(box_max, snapshot.maximum_index);
+    const Vec3i interior_size =
+            (snapshot.maximum_index - snapshot.minimum_index -
+             Vec3i::Ones()).cwiseMax(Vec3i::Zero());
+    const std::size_t voxel_count =
+            static_cast<std::size_t>(interior_size.x()) *
+            static_cast<std::size_t>(interior_size.y()) *
+            static_cast<std::size_t>(interior_size.z());
+    snapshot.values.resize(voxel_count);
+
+    std::size_t index = 0;
+    for (int x = snapshot.minimum_index.x() + 1;
+         x < snapshot.maximum_index.x(); ++x) {
+        for (int y = snapshot.minimum_index.y() + 1;
+             y < snapshot.maximum_index.y(); ++y) {
+            for (int z = snapshot.minimum_index.z() + 1;
+                 z < snapshot.maximum_index.z(); ++z) {
+                snapshot.values[index++] = occupancy_buffer_[
+                        getHashIndexFromGlobalIndex(Vec3i(x, y, z))];
+            }
+        }
+    }
+}
+
+void ProbMap::probabilityBoxSnapshotToPoints(
+        const ProbabilityBoxSnapshot& snapshot,
+        vec_E<Vec3f>& occupied_points,
+        vec_E<Vec3f>& unknown_points) const {
+    occupied_points.clear();
+    unknown_points.clear();
+    if (snapshot.values.empty()) {
+        return;
+    }
+    if (unknown_points.capacity() < snapshot.values.size()) {
+        unknown_points.reserve(snapshot.values.size());
+    }
+    if (occupied_points.capacity() < snapshot.values.size() / 8U) {
+        occupied_points.reserve(snapshot.values.size() / 8U);
+    }
+
+    std::size_t index = 0;
+    for (int x = snapshot.minimum_index.x() + 1;
+         x < snapshot.maximum_index.x(); ++x) {
+        for (int y = snapshot.minimum_index.y() + 1;
+             y < snapshot.maximum_index.y(); ++y) {
+            for (int z = snapshot.minimum_index.z() + 1;
+                 z < snapshot.maximum_index.z(); ++z) {
+                const float value = snapshot.values[index++];
+                if (!isOccupied(value) && !isUnknown(value)) {
+                    continue;
+                }
+                Vec3f position;
+                globalIndexToPos(Vec3i(x, y, z), position);
+                if (isOccupied(value)) {
+                    occupied_points.push_back(position);
+                } else {
+                    unknown_points.push_back(position);
+                }
+            }
+        }
+    }
+}
+
 void ProbMap::boxSearchInflate(const Vec3f& box_min, const Vec3f& box_max, const GridType& gt,
                                vec_E<Vec3f>& out_points) const {
     inf_map_->boxSearch(box_min, box_max, gt, out_points);
@@ -542,10 +686,8 @@ void ProbMap::probabilisticMapFromCache() {
     //                                                 -6));
     //    float ret = occupancy_buffer_[addr];
     //    std::cout << "ret: " << ret << std::endl;
-    while (!raycast_data_.update_cache_id_g.empty()) {
+    for (const Vec3i& id_g : raycast_data_.update_cache_id_g) {
         Vec3f pos;
-        Vec3i id_g = raycast_data_.update_cache_id_g.front();
-        raycast_data_.update_cache_id_g.pop();
         Vec3i id_l;
         globalIndexToLocalIndex(id_g, id_l);
         int hash_id = getLocalIndexHash(id_l);
@@ -560,6 +702,7 @@ void ProbMap::probabilisticMapFromCache() {
         raycast_data_.hit_cnt[hash_id] = 0;
         raycast_data_.operation_cnt[hash_id] = 0;
     }
+    raycast_data_.update_cache_id_g.clear();
 }
 
 void ProbMap::hitPointUpdate(const Vec3f& pos, const int& hash_id, const int& hit_num) {
@@ -577,10 +720,16 @@ void ProbMap::hitPointUpdate(const Vec3f& pos, const int& hash_id, const int& hi
     }
 
 
-    ret += cfg_.l_hit * hit_num;
-    if (ret > cfg_.l_max) {
-        ret = cfg_.l_max;
-    }
+    ret = applyCappedLogOddsEvidence(
+            ret,
+            static_cast<std::uint16_t>(hit_num),
+            0U,
+            cfg_.l_hit,
+            cfg_.l_miss,
+            cfg_.l_min,
+            cfg_.l_max,
+            cfg_.max_hit_updates_per_batch,
+            cfg_.max_miss_updates_per_batch);
 
     GridType to_type;
     if (isOccupied(ret)) {
@@ -622,10 +771,16 @@ void ProbMap::missPointUpdate(const Vec3f& pos, const int& hash_id, const int& h
     else {
         from_type = GridType::UNKNOWN;
     }
-    ret += cfg_.l_miss * hit_num;
-    if (ret < cfg_.l_min) {
-        ret = cfg_.l_min;
-    }
+    ret = applyCappedLogOddsEvidence(
+            ret,
+            0U,
+            static_cast<std::uint16_t>(hit_num),
+            cfg_.l_hit,
+            cfg_.l_miss,
+            cfg_.l_min,
+            cfg_.l_max,
+            cfg_.max_hit_updates_per_batch,
+            cfg_.max_miss_updates_per_batch);
 
     GridType to_type;
     if (isOccupied(ret)) {
@@ -658,10 +813,11 @@ void ProbMap::missPointUpdate(const Vec3f& pos, const int& hash_id, const int& h
     }
 }
 
-void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odom) {
+void ProbMap::raycastProcess(const PointCloud& input_cloud, const Pose& body_pose,
+                             const Vec3f& sensor_origin) {
     // bounding box of updated region
-    raycast_data_.cache_box_min = cur_odom;
-    raycast_data_.cache_box_max = cur_odom;
+    raycast_data_.cache_box_min = sensor_origin;
+    raycast_data_.cache_box_max = sensor_origin;
     Vec3f raycast_box_min, raycast_box_max;
 
     {
@@ -671,14 +827,28 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
     }
 
     /// Step 1; Raycast and add to update cache.
-    const int& cloud_in_size = input_cloud.size();
-    // new version of raycasting process
-    auto raycasting_cloud = vec_Vec3f{};
-    raycasting_cloud.reserve(cloud_in_size);
+    const std::size_t cloud_in_size = input_cloud.size();
+    auto& raycasting_cloud = raycast_data_.raycasting_endpoints;
+    raycasting_cloud.clear();
+    if (raycasting_cloud.capacity() < cloud_in_size) {
+        raycasting_cloud.reserve(cloud_in_size);
+    }
+    if (++raycast_data_.endpoint_epoch == 0U) {
+        std::fill(
+                raycast_data_.endpoint_seen_epoch.begin(),
+                raycast_data_.endpoint_seen_epoch.end(),
+                0U);
+        raycast_data_.endpoint_epoch = 1U;
+    }
 
     // 1) process all non-inf points, update occupied probability
     int temperol_cnt{0};
     for (const auto& pcl_p : input_cloud) {
+        if (!std::isfinite(pcl_p.x) || !std::isfinite(pcl_p.y) ||
+            !std::isfinite(pcl_p.z)) {
+            continue;
+        }
+
         // 1.1) intensity filter
         if (cfg_.intensity_thresh > 0 &&
             pcl_p.intensity < cfg_.intensity_thresh) {
@@ -692,6 +862,21 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
 
         Vec3f p(pcl_p.x, pcl_p.y, pcl_p.z);
         Vec3i pt_id_g;
+
+        if (cfg_.self_filter_en) {
+            const Vec3f point_in_body =
+                    body_pose.second.conjugate() * (p - body_pose.first);
+            if ((point_in_body.array() >= cfg_.self_filter_min.array()).all() &&
+                (point_in_body.array() <= cfg_.self_filter_max.array()).all()) {
+                continue;
+            }
+        }
+
+        const double initial_sqr_distance = (p - sensor_origin).squaredNorm();
+        if (!std::isfinite(initial_sqr_distance) ||
+            initial_sqr_distance < cfg_.sqr_raycast_range_min) {
+            continue;
+        }
 
         // no raycasting, purely add occ pints
         if (!cfg_.raycasting_en) {
@@ -710,23 +895,29 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
         if (p.z() > cfg_.virtual_ceil_height ) {
             update_hit = false;
             // find the intersect point with the ceil
-            const double dz = p.z() - cur_odom.z();
-            const double pc = cfg_.virtual_ceil_height - cur_odom.z();
-            p = cur_odom + (p - cur_odom).normalized() * pc / dz;
+            const double dz = p.z() - sensor_origin.z();
+            if (std::abs(dz) <= 1e-12) {
+                continue;
+            }
+            const double pc = cfg_.virtual_ceil_height - sensor_origin.z();
+            p = sensor_origin + (p - sensor_origin) * pc / dz;
         }else if (p.z() < cfg_.virtual_ground_height) {
             update_hit = false;
             // find the intersect point with the ground
-            const double dz = p.z() - cur_odom.z();
-            const double pc = cfg_.virtual_ground_height - cur_odom.z();
-            p = cur_odom + (p - cur_odom).normalized() * pc / dz;
+            const double dz = p.z() - sensor_origin.z();
+            if (std::abs(dz) <= 1e-12) {
+                continue;
+            }
+            const double pc = cfg_.virtual_ground_height - sensor_origin.z();
+            p = sensor_origin + (p - sensor_origin) * pc / dz;
         }
 
         // 1.4) bounding box filter
         // raycasting max
-        const double sqr_dis = (p - cur_odom).squaredNorm();
+        const double sqr_dis = (p - sensor_origin).squaredNorm();
         if (sqr_dis > cfg_.sqr_raycast_range_max) {
             double k = cfg_.raycast_range_max / sqrt(sqr_dis);
-            p = k * (p - cur_odom) + cur_odom;
+            p = k * (p - sensor_origin) + sensor_origin;
             update_hit = false;
         }
 
@@ -734,10 +925,14 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
         if (((p - raycast_box_min).minCoeff() < 0) ||
             ((p - raycast_box_max).maxCoeff() > 0)) {
             p = lineBoxIntersectPoint(p,
-                                      cur_odom,
+                                      sensor_origin,
                                       raycast_box_min,
                                       raycast_box_max);
             update_hit = false;
+        }
+
+        if (!p.array().isFinite().all() || !insideLocalMap(p)) {
+            continue;
         }
 
 
@@ -745,11 +940,16 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
         raycast_data_.cache_box_min = raycast_data_.cache_box_min.cwiseMin(p);
         raycast_data_.cache_box_max = raycast_data_.cache_box_max.cwiseMax(p);
 
-        // 1.4) for all validate hit points, update probability
-        raycasting_cloud.push_back(p);
+        posToGlobalIndex(p, pt_id_g);
+        const int endpoint_hash = getHashIndexFromGlobalIndex(pt_id_g);
+        if (raycast_data_.endpoint_seen_epoch[endpoint_hash] !=
+            raycast_data_.endpoint_epoch) {
+            raycast_data_.endpoint_seen_epoch[endpoint_hash] =
+                    raycast_data_.endpoint_epoch;
+            raycasting_cloud.push_back(p);
+        }
 
         if (update_hit) {
-            posToGlobalIndex(p, pt_id_g);
             insertUpdateCandidate(pt_id_g, true);
         }
     }
@@ -757,7 +957,11 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
     if(cfg_.raycasting_en) {
         // 4) process all inf points, updae free probability
         for (const auto& p : raycasting_cloud) {
-            Vec3f raycast_start = (p - cur_odom).normalized() * cfg_.raycast_range_min + cur_odom;
+            const Vec3f ray_direction = p - sensor_origin;
+            if (ray_direction.squaredNorm() <= 1e-12) {
+                continue;
+            }
+            Vec3f raycast_start = ray_direction.normalized() * cfg_.raycast_range_min + sensor_origin;
             raycast_data_.raycaster.setInput(raycast_start, p);
             Vec3f ray_pt;
             while (raycast_data_.raycaster.step(ray_pt)) {
@@ -775,12 +979,23 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
 
 void ProbMap::insertUpdateCandidate(const Vec3i& id_g, bool is_hit) {
     const auto& hash_id = getHashIndexFromGlobalIndex(id_g);
-    raycast_data_.operation_cnt[hash_id]++;
-    if (raycast_data_.operation_cnt[hash_id] == 1) {
-        raycast_data_.update_cache_id_g.push(id_g);
+    std::uint16_t& operation_count = raycast_data_.operation_cnt[hash_id];
+    std::uint16_t& hit_count = raycast_data_.hit_cnt[hash_id];
+    const std::uint16_t miss_count = operation_count - hit_count;
+
+    if (is_hit && hit_count >= cfg_.max_hit_updates_per_batch) {
+        return;
     }
+    if (!is_hit && miss_count >= cfg_.max_miss_updates_per_batch) {
+        return;
+    }
+
+    if (operation_count == 0U) {
+        raycast_data_.update_cache_id_g.push_back(id_g);
+    }
+    ++operation_count;
     if (is_hit) {
-        raycast_data_.hit_cnt[hash_id]++;
+        ++hit_count;
     }
 }
 
@@ -796,14 +1011,18 @@ void ProbMap::updateLocalBox(const Vec3f& cur_odom) {
     // The local map should follow current map center.
     std::lock_guard<std::mutex> lck(raycast_data_.raycast_range_mtx);
 
+    if (!cfg_.raycasting_en) {
+        raycast_data_.local_update_box_min = local_map_bound_min_d_;
+        raycast_data_.local_update_box_max = local_map_bound_max_d_;
+        return;
+    }
+
     Vec3i cur_odom_i;
     posToGlobalIndex(cur_odom, cur_odom_i);
     Vec3i local_updatebox_min_i, local_updatebox_max_i;
 
-    if (cfg_.raycasting_en) {
-        local_updatebox_max_i = cur_odom_i + cfg_.half_local_update_box_i;
-        local_updatebox_min_i = cur_odom_i - cfg_.half_local_update_box_i;
-    }
+    local_updatebox_max_i = cur_odom_i + cfg_.half_local_update_box_i;
+    local_updatebox_min_i = cur_odom_i - cfg_.half_local_update_box_i;
 
     globalIndexToPos(local_updatebox_min_i, raycast_data_.local_update_box_min);
     globalIndexToPos(local_updatebox_max_i, raycast_data_.local_update_box_max);
@@ -819,10 +1038,14 @@ void ProbMap::resetLocalMap() {
     std::cout << RED << " -- [Prob-Map] Clear all local map." << RESET << std::endl;
     // Clear local map
     std::fill(occupancy_buffer_.begin(), occupancy_buffer_.end(), 0);
-    while (!raycast_data_.update_cache_id_g.empty()) {
-        raycast_data_.update_cache_id_g.pop();
-    }
+    raycast_data_.update_cache_id_g.clear();
+    raycast_data_.raycasting_endpoints.clear();
     raycast_data_.batch_update_counter = 0;
     std::fill(raycast_data_.operation_cnt.begin(), raycast_data_.operation_cnt.end(), 0);
     std::fill(raycast_data_.hit_cnt.begin(), raycast_data_.hit_cnt.end(), 0);
+    std::fill(
+            raycast_data_.endpoint_seen_epoch.begin(),
+            raycast_data_.endpoint_seen_epoch.end(),
+            0U);
+    raycast_data_.endpoint_epoch = 0U;
 }

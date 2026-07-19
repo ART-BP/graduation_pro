@@ -24,10 +24,10 @@
 
 #pragma once
 
-#include <queue>
 #include <rog_map/inf_map.h>
 #include <rog_map/free_cnt_map.h>
 #include <rog_map/esdf_map.h>
+#include <rog_map/observation_model.hpp>
 #include <utils/raycaster.h>
 
 namespace rog_map {
@@ -36,6 +36,12 @@ namespace rog_map {
     public:
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
         typedef std::shared_ptr<ProbMap> Ptr;
+
+        struct ProbabilityBoxSnapshot {
+            Vec3i minimum_index{Vec3i::Zero()};
+            Vec3i maximum_index{Vec3i::Zero()};
+            std::vector<float> values;
+        };
 
         ProbMap() = default;
         ~ProbMap() = default;
@@ -70,6 +76,20 @@ namespace rog_map {
         void boxSearch(const Vec3f &_box_min, const Vec3f &_box_max,
                        const GridType &gt, vec_E<Vec3f> &out_points) const;
 
+        void boxSearchOccupiedAndUnknown(
+                const Vec3f &box_min, const Vec3f &box_max,
+                vec_E<Vec3f> &occupied_points,
+                vec_E<Vec3f> &unknown_points) const;
+
+        void copyProbabilityBox(
+                const Vec3f &box_min, const Vec3f &box_max,
+                ProbabilityBoxSnapshot &snapshot) const;
+
+        void probabilityBoxSnapshotToPoints(
+                const ProbabilityBoxSnapshot &snapshot,
+                vec_E<Vec3f> &occupied_points,
+                vec_E<Vec3f> &unknown_points) const;
+
         void boxSearchInflate(const Vec3f &box_min, const Vec3f &box_max,
                               const GridType &gt, vec_E<Vec3f> &out_points) const;
 
@@ -95,6 +115,9 @@ namespace rog_map {
 
         void updateProbMap(const PointCloud &cloud, const Pose &pose);
 
+        void updateProbMap(const PointCloud &cloud, const Pose &body_pose,
+                           const Vec3f &sensor_origin);
+
     protected:
         rog_map::Config cfg_;
         InfMap::Ptr inf_map_;
@@ -106,9 +129,12 @@ namespace rog_map {
         bool map_empty_{true};
         struct RaycastData {
             raycaster::RayCaster raycaster;
-            std::queue<Vec3i> update_cache_id_g;
+            vec_Vec3i update_cache_id_g;
+            vec_Vec3f raycasting_endpoints;
             std::vector<uint16_t> operation_cnt;
             std::vector<uint16_t> hit_cnt;
+            std::vector<uint16_t> endpoint_seen_epoch;
+            uint16_t endpoint_epoch{0};
             Vec3f cache_box_max, cache_box_min, local_update_box_max, local_update_box_min;
             int batch_update_counter{0};
             std::mutex raycast_range_mtx;
@@ -151,7 +177,8 @@ namespace rog_map {
 
         void missPointUpdate(const Vec3f &pos, const int &hash_id, const int &hit_num);
 
-        void raycastProcess(const PointCloud &input_cloud, const Vec3f &cur_odom);
+        void raycastProcess(const PointCloud &input_cloud, const Pose &body_pose,
+                            const Vec3f &sensor_origin);
 
         void insertUpdateCandidate(const Vec3i &id_g, bool is_hit);
 

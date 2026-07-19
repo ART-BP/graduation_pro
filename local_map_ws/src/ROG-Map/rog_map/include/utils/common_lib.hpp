@@ -67,7 +67,9 @@ namespace rog_map {
     const std::string BLUE = "\033[1;34m";
     const std::string RESET = "\033[0m";
 
-    typedef pcl::PointXYZINormal PclPoint;
+    // ROG-Map only consumes XYZ and intensity. Avoid carrying unused normal
+    // fields through every cloud conversion and cache copy.
+    typedef pcl::PointXYZI PclPoint;
     typedef pcl::PointCloud<PclPoint> PointCloud;
 
 
@@ -215,4 +217,3 @@ namespace rog_map {
         return false;
     }
 }
-

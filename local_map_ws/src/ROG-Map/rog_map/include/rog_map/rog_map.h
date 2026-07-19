@@ -23,9 +23,12 @@
 
 #pragma once
 
+#include <deque>
+
 #include <rog_map/prob_map.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <utils/common_lib.hpp>
 #include <dynamic_reconfigure/server.h>
@@ -35,7 +38,7 @@
 namespace rog_map {
     using namespace std;
 
-    typedef pcl::PointXYZINormal PointType;
+    typedef pcl::PointXYZI PointType;
     typedef pcl::PointCloud<PointType> PointCloudXYZIN;
 
     class ROGMap : public ProbMap {
@@ -74,11 +77,22 @@ namespace rog_map {
         struct ROSCallback {
             ros::Subscriber odom_sub, cloud_sub;
             int unfinished_frame_cnt{0};
-            Pose pc_pose;
-            PointCloud pc;
+            PointCloud::ConstPtr pc;
+            ros::Time pc_stamp;
+            ros::WallTime pc_received;
             ros::Timer update_timer;
-            mutex updete_lock;
+            mutex update_lock;
         } rc_;
+
+        struct TimedPose {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+            ros::Time stamp;
+            Pose pose;
+        };
+
+        std::deque<TimedPose, Eigen::aligned_allocator<TimedPose>> odom_history_;
+        mutable mutex state_mutex_;
+        mutable mutex map_mutex_;
 
         struct VisualizeMap {
             ros::Publisher occ_pub, unknown_pub,
@@ -87,6 +101,11 @@ namespace rog_map {
                     esdf_pub, esdf_neg_pub, esdf_occ_pub;
             visualization_msgs::MarkerArray mkr_arr;
             ros::Timer viz_timer;
+            mutex callback_mutex;
+            vec_E<Vec3f> occupied_points, unknown_points,
+                    occupied_inflated_points, unknown_inflated_points,
+                    frontier_points;
+            ProbabilityBoxSnapshot probability_snapshot;
             struct VizCfg {
                 dynamic_reconfigure::Server<rog_map::VizConfig> vizcfgserver;
                 dynamic_reconfigure::Server<rog_map::VizConfig>::CallbackType callback_func;
@@ -97,7 +116,11 @@ namespace rog_map {
 
         std::ofstream time_log_file_, map_info_log_file_;
 
-        void updateRobotState(const Pose &pose);
+        void updateRobotState(const Pose &pose, const ros::Time &stamp);
+
+        bool findPoseAt(const ros::Time &stamp, Pose &pose) const;
+
+        Vec3f sensorOriginFromBodyPose(const Pose &body_pose) const;
 
         void odomCallback(const nav_msgs::OdometryConstPtr &odom_msg);
 

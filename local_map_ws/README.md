@@ -47,7 +47,8 @@ FAST-LIO2 /cloud_registered + /Odometry
 
 如果希望使用 launch 文件中的可选 Grid Map 可视化节点，还需要系统提供 `grid_map_visualization`；默认 `visualize:=false` 不依赖它。
 
-ROG-Map 需要单独放入本工作区或其他已 source 的 catkin 工作区。官方 ROS 1 仓库为：
+运行所需的 ROG-Map 核心库已经精简保留在
+`src/ROG-Map/rog_map`，示例、MARSIM、演示图片和上游辅助脚本均未纳入运行工程。上游 ROS 1 仓库为：
 
 ```text
 https://github.com/hku-mars/ROG-Map

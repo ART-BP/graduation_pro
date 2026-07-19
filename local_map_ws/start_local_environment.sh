@@ -15,6 +15,6 @@ if [[ ! -f "${WORKSPACE_DIR}/devel/setup.bash" ]]; then
   exit 1
 fi
 
-source "${WORKSPACE_DIR}/devel/setup.bash"
+source "${WORKSPACE_DIR}/devel/setup.bash" --extend
 
 exec roslaunch go2w_local_environment local_mapping_pipeline.launch "$@"

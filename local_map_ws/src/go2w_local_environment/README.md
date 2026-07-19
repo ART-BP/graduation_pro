@@ -21,16 +21,16 @@ ROG-Map /rog_map_node/rog_map/{occ,unk}
 先确保 `lio_ws` 已经编译，然后执行：
 
 ```bash
-cd /home/allgo/mydrive/graduation_pro/local_map_ws
+cd /path/to/graduation_project/local_map_ws
 ./build.sh
 ```
 
-工作空间中的 `ROG-Map/examples` 已通过 `CATKIN_IGNORE` 排除，只编译 ROG-Map 核心库和本项目节点。
+工作空间仅保留运行所需的 `ROG-Map/rog_map` 核心库，只编译 ROG-Map 核心库和本项目节点。
 
 ## 启动完整流水线
 
 ```bash
-cd /home/allgo/mydrive/graduation_pro/local_map_ws
+cd /path/to/graduation_project/local_map_ws
 ./start_local_environment.sh
 ```
 
@@ -80,3 +80,27 @@ cd /home/allgo/mydrive/graduation_pro/local_map_ws
 - `config/projector.yaml`：二维地图尺寸、地面搜索范围、Go2W 最小净空等投影参数。
 
 `minimum_clearance` 和 `nominal_ground_offset` 当前为初始值，实机测试时需要根据 Go2W 姿态和可通过高度继续标定。
+
+## ROG-Map 体素更新 V1.1
+
+本项目在上游 ROG-Map 的概率地图和零拷贝滚动结构上，增加了以下观测更新约束：
+
+- `/cloud_registered` 按消息时间戳匹配 `/Odometry`，必要时在相邻位姿间插值；
+- 射线起点使用 LiDAR 在 `odom` 中的真实位置，而不是直接使用机体原点；
+- 丢弃非有限点，并支持在 `base_link` 下配置机器人本体过滤包围盒；
+- 相同终点体素只执行一条射线，同一批次内每个体素的 hit/miss 证据均可限幅；
+- 当前概率参数要求三次独立 miss 才把初始未知体素确认为自由，并可在三帧自由观测后清除单次命中的动态障碍。
+
+相关参数位于 `config/rog_map_go2w.yaml` 的 `ros_callback`、`self_filter` 和
+`raycasting` 段。其中 `sensor_origin_in_body` 必须与 FAST-LIO 的
+`extrinsic_T` 保持一致；`self_filter` 在实机测量 Go2W 相对 `base_link`
+的包围盒之前保持关闭。
+
+## ROG-Map 实时性优化 V1.2
+
+- 局部概率地图缩小为 `10 m × 10 m × 5 m`，最大射线距离为 `12 m`；
+- 输入点类型精简为 ROG 实际使用的 `XYZI`，最新点云通过只读共享指针交给更新线程，不再进行第二次深拷贝；
+- `point_filt_num` 设为 `2`，在多帧概率融合条件下限制单帧射线数量；
+- 射线端点和更新候选使用可复用的连续缓存，避免逐帧队列分配；
+- 占据与未知体素在一次遍历中同时提取，并使用相同时间戳发布；
+- `PointCloud2` 直接写入，消息转换和发布移到地图锁之外，减少点云到达时的等待。

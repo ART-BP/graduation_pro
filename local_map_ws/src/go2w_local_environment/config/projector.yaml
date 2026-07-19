@@ -1,7 +1,7 @@
 map:
   frame_id: odom
-  length_x: 20.0
-  length_y: 20.0
+  length_x: 10.0
+  length_y: 10.0
   resolution: 0.20
 
 publish_rate: 5.0

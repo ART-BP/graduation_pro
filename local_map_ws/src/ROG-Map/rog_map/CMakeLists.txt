@@ -60,7 +60,6 @@ include_directories(
 set(THIRD_PARTY
         ${catkin_LIBRARIES}
         ${PCL_LIBRARIES}
-        -ldw
         )
 
 file(GLOB_RECURSE srcs CONFIGURE_DEPENDS src/*.cpp include/*.h include/*.hpp include/*.cpp)
@@ -70,3 +69,11 @@ add_dependencies(rog_map ${PROJECT_NAME}_gencfg)
 target_include_directories(rog_map PUBLIC include)
 target_link_libraries(rog_map PUBLIC
         ${THIRD_PARTY})
+
+if(CATKIN_ENABLE_TESTING)
+    catkin_add_gtest(test_observation_model
+            test/test_observation_model.cpp)
+    if(TARGET test_observation_model)
+        target_link_libraries(test_observation_model ${catkin_LIBRARIES})
+    endif()
+endif()
