@@ -1,0 +1,37 @@
+services:
+  planner:
+    build:
+      context: .
+      target: runtime
+      args:
+        ISAAC_LAB_IMAGE: nvcr.io/nvidia/isaac-lab:2.3.2
+        GO2W_IMAGE_VERSION: 0.1.0
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    image: go2w-terrain-planner:0.1.0
+    network_mode: host
+    ipc: host
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      GO2W_DATA_ROOT: /workspace/data
+    volumes:
+      - ${GO2W_DATA_DIR:-./data}:/workspace/data
+      - isaac-kit-cache:/isaac-sim/kit/cache
+      - isaac-ov-cache:/root/.cache/ov
+      - isaac-pip-cache:/root/.cache/pip
+      - isaac-compute-cache:/root/.nv/ComputeCache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+
+volumes:
+  isaac-kit-cache:
+  isaac-ov-cache:
+  isaac-pip-cache:
+  isaac-compute-cache:

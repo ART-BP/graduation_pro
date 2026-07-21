@@ -1,0 +1,32 @@
+training:
+  seed: 42
+  device: cuda:0
+  num_envs: 32
+  maximum_iterations: 1500
+  output_root: /workspace/data/runs
+runner:
+  num_steps_per_env: 24
+  save_interval: 50
+  experiment_name: go2w_terrain_navigation
+  run_name: phase1_proxy
+  clip_actions: null
+ppo:
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.005
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.0003
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+model:
+  map_feature_dim: 128
+  temporal_hidden_dim: 128
+  auxiliary_hidden_dim: 64
+  fusion_hidden_dim: 128
+  initial_action_std: 0.5
+  critic_hidden_dims: [128, 128]

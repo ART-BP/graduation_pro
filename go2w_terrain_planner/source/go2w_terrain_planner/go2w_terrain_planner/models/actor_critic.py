@@ -1,0 +1,170 @@
+"""RSL-RL 3.1 compatible CNN-GRU actor-critic for flattened policy observations."""
+
+from __future__ import annotations
+
+from typing import Any, NoReturn
+
+import torch
+from torch import nn
+from torch.distributions import Normal
+
+from .map_encoder import MapEncoder
+from .temporal_encoder import TemporalEncoder
+
+
+class Go2wActorCritic(nn.Module):
+    """Custom policy used through a small RSL-RL 3.1 runner registration hook."""
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        obs,
+        obs_groups: dict[str, list[str]],
+        num_actions: int,
+        *,
+        map_history_length: int = 5,
+        map_channels: int = 4,
+        map_size: int = 100,
+        map_feature_dim: int = 128,
+        temporal_hidden_dim: int = 128,
+        auxiliary_hidden_dim: int = 64,
+        fusion_hidden_dim: int = 128,
+        critic_hidden_dims: list[int] | tuple[int, ...] = (128, 128),
+        init_noise_std: float = 0.5,
+        noise_std_type: str = "scalar",
+        actor_obs_normalization: bool = False,
+        critic_obs_normalization: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs, actor_obs_normalization, critic_obs_normalization
+        super().__init__()
+        if noise_std_type != "scalar":
+            raise ValueError("第一版Go2wActorCritic仅支持scalar动作标准差")
+        self.obs_groups = obs_groups
+        self.map_history_length = map_history_length
+        self.map_channels = map_channels
+        self.map_size = map_size
+        self.map_flat_dim = map_history_length * map_channels * map_size * map_size
+        actor_dim = sum(obs[name].shape[-1] for name in obs_groups["policy"])
+        if actor_dim <= self.map_flat_dim:
+            raise ValueError(f"policy观测维度{actor_dim}不足以容纳地图{self.map_flat_dim}")
+        self.auxiliary_dim = actor_dim - self.map_flat_dim
+
+        self.map_encoder = MapEncoder(map_channels, map_feature_dim)
+        self.temporal_encoder = TemporalEncoder(map_feature_dim, temporal_hidden_dim)
+        self.auxiliary_encoder = nn.Sequential(
+            nn.Linear(self.auxiliary_dim, auxiliary_hidden_dim), nn.ELU(), nn.Linear(auxiliary_hidden_dim, auxiliary_hidden_dim), nn.ELU()
+        )
+        self.actor_head = nn.Sequential(
+            nn.Linear(temporal_hidden_dim + auxiliary_hidden_dim, fusion_hidden_dim),
+            nn.ELU(),
+            nn.Linear(fusion_hidden_dim, num_actions),
+        )
+
+        critic_dim = sum(obs[name].shape[-1] for name in obs_groups["critic"])
+        critic_layers: list[nn.Module] = []
+        previous = critic_dim
+        for hidden in critic_hidden_dims:
+            critic_layers.extend((nn.Linear(previous, hidden), nn.ELU()))
+            previous = hidden
+        critic_layers.append(nn.Linear(previous, 1))
+        self.critic = nn.Sequential(*critic_layers)
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.distribution: Normal | None = None
+        self._pre_tanh_action: torch.Tensor | None = None
+        Normal.set_default_validate_args(False)
+
+    def forward(self) -> NoReturn:
+        raise NotImplementedError
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        del dones
+
+    def _group(self, obs, group: str) -> torch.Tensor:
+        return torch.cat([obs[name] for name in self.obs_groups[group]], dim=-1)
+
+    def _actor_raw_mean(self, actor_obs: torch.Tensor) -> torch.Tensor:
+        batch = actor_obs.shape[0]
+        maps = actor_obs[:, : self.map_flat_dim].reshape(
+            batch, self.map_history_length, self.map_channels, self.map_size, self.map_size
+        )
+        auxiliary = actor_obs[:, self.map_flat_dim :]
+        per_frame = self.map_encoder(maps.reshape(-1, self.map_channels, self.map_size, self.map_size))
+        per_frame = per_frame.reshape(batch, self.map_history_length, -1)
+        temporal = self.temporal_encoder(per_frame)
+        auxiliary_feature = self.auxiliary_encoder(auxiliary)
+        return self.actor_head(torch.cat((temporal, auxiliary_feature), dim=-1))
+
+    def _actor_forward(self, actor_obs: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self._actor_raw_mean(actor_obs))
+
+    def _update_distribution(self, obs) -> None:
+        mean = self._actor_raw_mean(self._group(obs, "policy"))
+        self.distribution = Normal(mean, torch.clamp(self.std, min=1.0e-3).expand_as(mean))
+        self._pre_tanh_action = None
+
+    def act(self, obs, **kwargs) -> torch.Tensor:
+        del kwargs
+        self._update_distribution(obs)
+        self._pre_tanh_action = self.distribution.sample()
+        return torch.tanh(self._pre_tanh_action)
+
+    def act_inference(self, obs) -> torch.Tensor:
+        return self._actor_forward(self._group(obs, "policy"))
+
+    def evaluate(self, obs, **kwargs) -> torch.Tensor:
+        del kwargs
+        return self.critic(self._group(obs, "critic"))
+
+    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        bounded = torch.clamp(actions, min=-1.0 + 1.0e-6, max=1.0 - 1.0e-6)
+        pre_tanh = torch.atanh(bounded)
+        correction = torch.log(torch.clamp(1.0 - bounded.square(), min=1.0e-6))
+        return (self.distribution.log_prob(pre_tanh) - correction).sum(dim=-1)
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        # RSL-RL stores this value together with ``action_std`` and uses both
+        # to estimate the Gaussian KL divergence for its adaptive learning-rate
+        # schedule.  The KL must be evaluated in the pre-tanh variable space;
+        # the environment still receives the bounded sample returned by act().
+        return self.distribution.mean
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        return self.distribution.stddev
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        if self._pre_tanh_action is None:
+            return self.distribution.entropy().sum(dim=-1)
+        bounded = torch.tanh(self._pre_tanh_action)
+        correction = torch.log(torch.clamp(1.0 - bounded.square(), min=1.0e-6))
+        return (self.distribution.entropy() + correction).sum(dim=-1)
+
+    def update_normalization(self, obs) -> None:
+        del obs
+
+    def load_state_dict(self, state_dict, strict: bool = True) -> bool:
+        super().load_state_dict(state_dict, strict=strict)
+        return True
+
+
+class ActorExportWrapper(nn.Module):
+    """ONNX wrapper that emits deployable physical ``[v_cmd,w_cmd]`` values."""
+
+    def __init__(
+        self,
+        actor_critic: Go2wActorCritic,
+        action_min: tuple[float, float],
+        action_max: tuple[float, float],
+    ) -> None:
+        super().__init__()
+        self.actor_critic = actor_critic
+        self.register_buffer("action_min", torch.tensor(action_min, dtype=torch.float32))
+        self.register_buffer("action_max", torch.tensor(action_max, dtype=torch.float32))
+
+    def forward(self, policy_observation: torch.Tensor) -> torch.Tensor:
+        normalized = self.actor_critic._actor_forward(policy_observation)
+        return self.action_min + 0.5 * (normalized + 1.0) * (self.action_max - self.action_min)

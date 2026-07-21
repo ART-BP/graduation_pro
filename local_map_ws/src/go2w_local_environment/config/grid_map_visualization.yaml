@@ -4,14 +4,15 @@ grid_map_visualizations:
     type: point_cloud
     params:
       layer: ground_height
-  - name: ceiling
-    type: point_cloud
-    params:
-      layer: ceiling_height
-  - name: blocked
+  - name: height_range
     type: occupancy_grid
     params:
-      layer: blocked
+      layer: height_range
+      data_min: 0.0
+      data_max: 1.5
+  - name: observed
+    type: occupancy_grid
+    params:
+      layer: observed_mask
       data_min: 0.0
       data_max: 1.0
-

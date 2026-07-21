@@ -1,106 +1,30 @@
-# Go2W 局部环境表示
+# go2w_local_environment
 
-当前工作空间已经形成一条完整 ROS1 流水线：
+该 ROS1 包把 FAST-LIO2 注册点云直接增量更新到三通道滚动局部高程 Grid Map，不依赖 ROG-Map。
 
-```text
-XT16 /lidar_points + IMU /Imu
-              ↓
-FAST-LIO2 /cloud_registered + /Odometry
-              ↓
-ROG-Map /rog_map_node/rog_map/{occ,unk}
-              ↓
-双层高度—净空投影
-              ↓
-/local_environment/grid_map + /local_environment/blocked
-```
+输入：
 
-所有中间地图和最终地图统一使用 `odom` 坐标系。ROG-Map 同时发布占据体素和未知体素，使投影模块能够区分已观测自由空间与未知空间。
+- /cloud_registered：已完成运动补偿并注册到 odom 的 XT16 点云；
+- /Odometry：与点云同一时间戳的 FAST-LIO2 位姿。
 
-## 编译
+输出 /local_environment/grid_map 包含：
 
-先确保 `lio_ws` 已经编译，然后执行：
+- ground_height：相对于机器人脚下参考地面的高程；平地约为 0；
+- height_range：单元内最大高度与最小高度之差；
+- observed_mask：存在有效回波或有激光束穿过时为 1，否则为 0。
 
-```bash
-cd /path/to/graduation_project/local_map_ws
-./build.sh
-```
+同步输出 `/local_environment/ground_reference`（`geometry_msgs/PointStamped`）。消息时间戳与 Grid Map
+一致，`point.z` 是本帧使用的 odom 系绝对脚下地面参考高度，`point.x/y` 是对应机器人位置。学习型规划器
+使用该标量统一历史相对高程图的垂直零点。
 
-工作空间仅保留运行所需的 `ROG-Map/rog_map` 核心库，只编译 ROG-Map 核心库和本项目节点。
+每帧输入先裁剪为机器人中心 15 m × 15 m，输出地图固定为 10 m × 10 m。雷达原点到回波点之间执行二维栅格射线遍历，穿越单元更新观测掩码，终点单元增量更新高度。每个终点栅格融合最近 5 次观测，地图滚动时保留重叠区域并清空新边缘。地图坐标轴保持 odom 方向。
 
-## 启动完整流水线
+高度历史和射线状态采用独立有效期：实测高度默认保留 10 s，射线穿越状态保留 1 s；机器人周围 0.8 m 内的历史实测高度不因超时清除，用于覆盖雷达近场盲区。过期检查每帧只处理 8000 格，约 0.5 s 完成一次全图轮询。高程端点仍按 0.05 m 落格，射线穿越独立按 0.10 m 去重，同一帧每个穿越格只写一次。
 
-```bash
-cd /path/to/graduation_project/local_map_ws
-./start_local_environment.sh
-```
+发布前对半径 2 格内、至少具有 3 个有效邻居且邻域高差不超过 0.08 m 的孤立孔洞进行中值补全。补全必须在至少一个方向上得到两侧支撑，遇到台阶或障碍边缘时保持未知。补全由后台线程默认以 2 Hz 计算，主回调逐帧复用最近完成且与当前滚动地图版本一致的结果。补全值不写回真实测量历史；`observed_mask` 仍表示真实回波或射线穿越，不会因插值被改写。
 
-默认同时启动：
+点云投影使用按栅格索引排序的连续样本缓存，避免为 200 × 200 个栅格逐帧创建独立容器。
 
-- `/laserMapping`：FAST-LIO2；
-- `/rog_map_node`：机器人中心局部三维占据地图；
-- `/local_environment`：双层高度—净空投影。
+内部历史始终保存 odom 坐标系下的绝对高程，发布前才统一减去当前脚下地面参考高度，避免不同时刻的参考值污染多帧融合。参考高度优先取机器人周围低高度差栅格的中值；数据不足时使用经过当前姿态旋转的 `IMU -> 地面` 标称偏移。`height_reference/imu_to_ground_height` 必须根据实机正常站立状态标定。
 
-需要显示 FAST-LIO 原有 RViz 配置时：
-
-```bash
-./start_local_environment.sh fast_lio_rviz:=true
-```
-
-如果 FAST-LIO 已经在其他终端运行，只启动 ROG-Map 和投影模块：
-
-```bash
-./start_local_environment.sh start_fast_lio:=false
-```
-
-可覆盖的主要启动参数包括：
-
-- `lidar_input_topic`，默认 `/lidar_points`；
-- `cloud_topic`，默认 `/cloud_registered`；
-- `odometry_topic`，默认 `/Odometry`；
-- `rog_map_config` 和 `projector_config`；
-- `visualize_grid_map`，系统安装 `grid_map_visualization` 后可设为 `true`。
-
-## 输出
-
-`/local_environment/grid_map` 为 `grid_map_msgs/GridMap`，包含以下固定二维通道：
-
-- `ground_height`：地面高度；
-- `ceiling_height`：顶部障碍高度；
-- `clearance`：垂直净空；
-- `blocked`：净空或未知约束形成的阻塞标记；
-- `observed`、`ground_observed`、`ceiling_observed`：观测有效性；
-- `unknown_fraction`：机器人所需净空范围内的未知体素比例；
-- `occupied_count`：当前二维栅格柱内的占据体素数量。
-
-`/local_environment/blocked` 是便于传统 ROS 工具显示的 `nav_msgs/OccupancyGrid` 阻塞图。
-
-主要参数位于：
-
-- `config/rog_map_go2w.yaml`：三维占据地图范围、分辨率、射线更新和可视化输出；
-- `config/projector.yaml`：二维地图尺寸、地面搜索范围、Go2W 最小净空等投影参数。
-
-`minimum_clearance` 和 `nominal_ground_offset` 当前为初始值，实机测试时需要根据 Go2W 姿态和可通过高度继续标定。
-
-## ROG-Map 体素更新 V1.1
-
-本项目在上游 ROG-Map 的概率地图和零拷贝滚动结构上，增加了以下观测更新约束：
-
-- `/cloud_registered` 按消息时间戳匹配 `/Odometry`，必要时在相邻位姿间插值；
-- 射线起点使用 LiDAR 在 `odom` 中的真实位置，而不是直接使用机体原点；
-- 丢弃非有限点，并支持在 `base_link` 下配置机器人本体过滤包围盒；
-- 相同终点体素只执行一条射线，同一批次内每个体素的 hit/miss 证据均可限幅；
-- 当前概率参数要求三次独立 miss 才把初始未知体素确认为自由，并可在三帧自由观测后清除单次命中的动态障碍。
-
-相关参数位于 `config/rog_map_go2w.yaml` 的 `ros_callback`、`self_filter` 和
-`raycasting` 段。其中 `sensor_origin_in_body` 必须与 FAST-LIO 的
-`extrinsic_T` 保持一致；`self_filter` 在实机测量 Go2W 相对 `base_link`
-的包围盒之前保持关闭。
-
-## ROG-Map 实时性优化 V1.2
-
-- 局部概率地图缩小为 `10 m × 10 m × 5 m`，最大射线距离为 `12 m`；
-- 输入点类型精简为 ROG 实际使用的 `XYZI`，最新点云通过只读共享指针交给更新线程，不再进行第二次深拷贝；
-- `point_filt_num` 设为 `2`，在多帧概率融合条件下限制单帧射线数量；
-- 射线端点和更新候选使用可复用的连续缓存，避免逐帧队列分配；
-- 占据与未知体素在一次遍历中同时提取，并使用相同时间戳发布；
-- `PointCloud2` 直接写入，消息转换和发布移到地图锁之外，减少点云到达时的等待。
+RViz 配置位于 rviz/local_elevation.rviz，参数见 config/projector.yaml。

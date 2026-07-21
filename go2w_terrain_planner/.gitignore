@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+logs/
+data/runs/*
+data/export/*
+!data/runs/.gitkeep
+!data/export/.gitkeep
+*.bag
+*.db3
+*.pt
+*.pth
+*.onnx

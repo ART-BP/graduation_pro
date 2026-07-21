@@ -1,0 +1,26 @@
+[package]
+
+# Semantic Versioning is used: https://semver.org/
+version = "0.1.0"
+
+# Description
+category = "isaaclab"
+readme  = "README.md"
+
+title = "Go2W Terrain Planner"
+author = "Go2W Terrain Navigation Project"
+maintainer = "Go2W Terrain Navigation Project"
+description="Learning-based local terrain navigation for Unitree Go2W"
+repository = "local"
+keywords = ["isaaclab", "reinforcement-learning", "navigation", "go2w"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_rl" = {}
+"isaaclab_tasks" = {}
+
+[[python.module]]
+name = "go2w_terrain_planner"
+
+[isaac_lab_settings]

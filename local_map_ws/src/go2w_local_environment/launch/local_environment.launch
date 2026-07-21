@@ -1,37 +1,15 @@
 <launch>
   <arg name="config"
        default="$(find go2w_local_environment)/config/projector.yaml"/>
-  <arg name="occupied_cloud_topic"
-       default="/rog_map_node/rog_map/occ"/>
-  <arg name="unknown_cloud_topic"
-       default="/rog_map_node/rog_map/unk"/>
+  <arg name="cloud_topic" default="/cloud_registered"/>
   <arg name="odometry_topic" default="/Odometry"/>
-  <arg name="use_unknown_cloud" default="true"/>
-  <arg name="visualize" default="false"/>
 
   <node pkg="go2w_local_environment"
         type="local_environment_node"
         name="local_environment"
         output="screen">
     <rosparam command="load" file="$(arg config)"/>
-    <param name="topics/occupied_cloud"
-           value="$(arg occupied_cloud_topic)"/>
-    <param name="topics/unknown_cloud"
-           value="$(arg unknown_cloud_topic)"/>
-    <param name="topics/odometry"
-           value="$(arg odometry_topic)"/>
-    <param name="use_unknown_cloud"
-           value="$(arg use_unknown_cloud)"/>
+    <param name="topics/cloud" value="$(arg cloud_topic)"/>
+    <param name="topics/odometry" value="$(arg odometry_topic)"/>
   </node>
-
-  <group if="$(arg visualize)">
-    <node pkg="grid_map_visualization"
-          type="grid_map_visualization"
-          name="local_environment_visualization"
-          output="screen">
-      <rosparam command="load"
-                file="$(find go2w_local_environment)/config/grid_map_visualization.yaml"/>
-    </node>
-  </group>
 </launch>
-

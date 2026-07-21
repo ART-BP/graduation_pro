@@ -1,36 +1,95 @@
 map:
+  # /cloud_registered and /Odometry are both published in this FAST-LIO frame.
   frame_id: odom
   length_x: 10.0
   length_y: 10.0
-  resolution: 0.20
+  resolution: 0.05
 
-publish_rate: 5.0
-# Maximum wall-clock age since each input was received by this node.
-maximum_input_age: 1.0
-use_unknown_cloud: true
+input_crop:
+  # Each registered LiDAR frame is first truncated to a robot-centered
+  # 15 m x 15 m horizontal box. The rolling map uses the inner 10 m x 10 m.
+  length_x: 15.0
+  length_y: 15.0
+
+sensor:
+  # XT16 origin expressed in the FAST-LIO body/IMU frame. Keep this equal to
+  # mapping/extrinsic_T in FAST_LIO/config/xt16.yaml.
+  origin_in_body: [0.171, 0.0, 0.0908]
+
+height_reference:
+  # FAST-LIO odometry is located at the IMU origin in the Go2W body. Measure
+  # this value on the real robot in its normal standing configuration.
+  imu_to_ground_height: 0.35
+
+  # Prefer the median absolute ground height measured around the robot. The
+  # rotated nominal IMU-to-ground offset is used when there are too few cells.
+  local_ground_radius: 1.0
+  minimum_ground_cells: 5
+  maximum_cell_height_range: 0.15
+  maximum_nominal_difference: 0.30
+
+raycasting:
+  # Ray traversal only updates observed_mask, so it can be deduplicated more
+  # coarsely than the 0.05 m endpoint elevation grid without reducing the
+  # published map resolution.
+  resolution: 0.10
 
 topics:
+  cloud: /cloud_registered
   odometry: /Odometry
-  occupied_cloud: /rog_map_node/rog_map/occ
-  unknown_cloud: /rog_map_node/rog_map/unk
   grid_map: /local_environment/grid_map
-  blocked_map: /local_environment/blocked
+  ground_reference: /local_environment/ground_reference
+
+sync:
+  # FAST-LIO publishes registered cloud and odometry with the same scan-end
+  # stamp. Approximate synchronization also tolerates small transport jitter.
+  queue_size: 10
+  subscriber_queue_size: 5
+  tolerance: 0.05
 
 projection:
-  # Must match the ROG-Map probability-map resolution.
-  voxel_resolution: 0.10
+  # Keep only points in this vertical interval relative to the current body
+  # position before assigning them to the local XY grid.
+  vertical_min_offset: -1.5
+  vertical_max_offset: 1.5
 
-  # Vertical projection volume relative to the FAST-LIO2 body position.
-  vertical_min_offset: -1.50
-  vertical_max_offset: 2.00
+  # Internally, ground height is the configured low percentile of absolute
+  # odom-frame point heights. The published layer is shifted so that the
+  # estimated supporting ground below the robot is zero.
+  ground_percentile: 0.10
 
-  # Ground candidates relative to the body position.
-  ground_search_min_offset: -1.20
-  ground_search_max_offset: 0.30
-  # Initial base_link-to-ground estimate. Tune from stationary data.
-  nominal_ground_offset: -0.35
+  # Cells with fewer retained points stay unknown: observed_mask=0 and the
+  # two height channels remain NaN. Start with 1 for the sparse XT16 scan.
+  minimum_points_per_cell: 1
 
-  # Initial conservative value; calibrate against the real Go2W posture.
-  minimum_clearance: 0.65
-  maximum_unknown_fraction: 0.20
-  unknown_is_blocked: false
+fusion:
+  # Each directly measured cell retains at most five frame measurements.
+  history_length: 5
+
+  # Ground measurements are static terrain memory and live much longer than
+  # ray traversal state. Cells are still cleared when they roll out of map.
+  elevation_stale_after: 10.0
+  ray_stale_after: 1.0
+
+  # Do not expire previously measured elevation beneath/around the robot,
+  # where the LiDAR has a near-field blind region.
+  robot_history_keep_radius: 0.8
+
+  # Check one fifth of the 200 x 200 map per LiDAR frame. At 10 Hz every cell
+  # is revisited within 0.5 s, avoiding a full-map scan in one callback.
+  expiration_cells_per_frame: 8000
+
+hole_filling:
+  # Fill only small output holes supported from opposite sides. The estimate
+  # is never inserted into the raw per-cell measurement history.
+  enabled: true
+  radius_cells: 2
+  minimum_neighbors: 3
+  maximum_ground_height_difference: 0.08
+
+  # Raw elevation still updates every LiDAR frame. Static hole estimates are
+  # recomputed by a background worker at 2 Hz and reused by the ROS callback.
+  update_interval: 0.5
+
+diagnostics:
+  slow_processing_threshold: 50.0

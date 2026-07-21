@@ -4,31 +4,27 @@
   <arg name="lidar_input_topic" default="/lidar_points"/>
   <arg name="cloud_topic" default="/cloud_registered"/>
   <arg name="odometry_topic" default="/Odometry"/>
-  <arg name="rog_map_config"
-       default="$(find go2w_local_environment)/config/rog_map_go2w.yaml"/>
   <arg name="projector_config"
        default="$(find go2w_local_environment)/config/projector.yaml"/>
-  <arg name="visualize_grid_map" default="true"/>
 
   <group if="$(arg start_fast_lio)">
     <include file="$(find fast_lio)/launch/mapping_xt16.launch">
-      <arg name="rviz" value="$(arg fast_lio_rviz)"/>
+      <arg name="rviz" value="false"/>
       <arg name="lidar_input_topic" value="$(arg lidar_input_topic)"/>
     </include>
   </group>
 
-  <include file="$(find go2w_local_environment)/launch/rog_map.launch">
-    <arg name="config" value="$(arg rog_map_config)"/>
+  <include file="$(find go2w_local_environment)/launch/local_environment.launch">
+    <arg name="config" value="$(arg projector_config)"/>
     <arg name="cloud_topic" value="$(arg cloud_topic)"/>
     <arg name="odometry_topic" value="$(arg odometry_topic)"/>
   </include>
 
-  <include file="$(find go2w_local_environment)/launch/local_environment.launch">
-    <arg name="config" value="$(arg projector_config)"/>
-    <arg name="occupied_cloud_topic" value="/rog_map_node/rog_map/occ"/>
-    <arg name="unknown_cloud_topic" value="/rog_map_node/rog_map/unk"/>
-    <arg name="odometry_topic" value="$(arg odometry_topic)"/>
-    <arg name="use_unknown_cloud" value="true"/>
-    <arg name="visualize" value="$(arg visualize_grid_map)"/>
-  </include>
+  <group if="$(arg fast_lio_rviz)">
+    <node pkg="rviz"
+          type="rviz"
+          name="rviz"
+          args="-d $(find go2w_local_environment)/rviz/local_elevation.rviz -f odom"
+          output="screen"/>
+  </group>
 </launch>

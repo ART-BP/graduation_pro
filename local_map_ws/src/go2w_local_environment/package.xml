@@ -3,8 +3,8 @@
   <name>go2w_local_environment</name>
   <version>0.1.0</version>
   <description>
-    Robot-centric dual-layer elevation and vertical-clearance projection for
-    the Unitree Go2W local navigation stack.
+    Direct local elevation-grid projection from FAST-LIO2 registered point
+    clouds for the Unitree Go2W navigation stack.
   </description>
 
   <maintainer email="maintainer@example.com">Go2W Navigation Project</maintainer>
@@ -15,10 +15,10 @@
   <depend>grid_map_core</depend>
   <depend>grid_map_msgs</depend>
   <depend>grid_map_ros</depend>
+  <depend>geometry_msgs</depend>
+  <depend>message_filters</depend>
   <depend>nav_msgs</depend>
   <depend>pcl_conversions</depend>
-  <depend>pcl_ros</depend>
-  <depend>rog_map</depend>
   <depend>roscpp</depend>
   <depend>sensor_msgs</depend>
 

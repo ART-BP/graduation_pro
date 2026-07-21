@@ -1,0 +1,18 @@
+action:
+  linear_min_mps: -0.2
+  linear_max_mps: 0.8
+  angular_min_radps: -1.0
+  angular_max_radps: 1.0
+  linear_acceleration_limit_mps2: 0.8
+  angular_acceleration_limit_radps2: 2.0
+execution_model:
+  linear_time_constant_s: 0.25
+  angular_time_constant_s: 0.20
+  maximum_terrain_speed_loss: 0.25
+  tracking_noise_std: 0.02
+  entry_angle_speed_penalty: 0.40
+  terrain_tilt_gain_rad: 1.0
+  entry_tilt_gain: 0.50
+  poor_entry_alignment_threshold: 0.25
+  stuck_height_range_min_m: 0.18
+  stuck_friction_threshold: 0.55
