@@ -422,18 +422,6 @@ class TerrainNavigationEnv(DirectRLEnv):
         return terminated, time_out
 
     def _get_rewards(self) -> torch.Tensor:
-        goal_delta = self.goal_xy - self.pose[:, :2]
-
-        goal_bearing_world = torch.atan2(
-            goal_delta[:, 1],
-            goal_delta[:, 0],
-        )
-
-        goal_bearing = torch.atan2(
-            torch.sin(goal_bearing_world - self.pose[:, 2]),
-            torch.cos(goal_bearing_world - self.pose[:, 2]),
-        )
-
         reward = navigation_reward(
             self.previous_distance,
             self.current_distance,
@@ -446,11 +434,8 @@ class TerrainNavigationEnv(DirectRLEnv):
             self.collision,
             self.unstable,
             self.stuck,
-            goal_bearing,
-            self.execution_model.actual_velocity,
             self.reward_weights,
         )
-
         self.previous_distance.copy_(self.current_distance)
         return reward
 
@@ -530,28 +515,14 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.bad_observation_steps[env_ids] = 0
         self.execution_model.reset(env_ids)
         self.map_generator.reset(env_ids, self.curriculum.levels[env_ids])
-
-        # 先确定机器人初始航向，再依据完整位姿生成目标。
-        heading_error = 0.7 * (
-            torch.rand(count, device=self.device) - 0.5
-        )
-        self.pose[env_ids, 2] = torch.atan2(
-            torch.sin(
-                self.map_generator.route_yaw[env_ids]
-                + heading_error
-            ),
-            torch.cos(
-                self.map_generator.route_yaw[env_ids]
-                + heading_error
-            ),
-        )
-
         self.goal_xy[env_ids] = self.map_generator.sample_task_goals(
             self.pose[env_ids],
             self.cfg.local_goal_minimum_m,
             self.cfg.local_goal_maximum_m,
             env_ids,
         )
+        heading_error = 0.7 * (torch.rand(count, device=self.device) - 0.5)
+        self.pose[env_ids, 2] = self.map_generator.route_yaw[env_ids] + heading_error
         generated_map, ground_reference_z = self.map_generator.generate(
             self.pose[env_ids],
             self.execution_model.actual_velocity[env_ids],

@@ -177,6 +177,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.current_map = torch.zeros(
             (self.num_envs, cfg.map_channels, cfg.map_size, cfg.map_size), device=self.device
         )
+        self._reset_idx(torch.arange(self.num_envs, device=self.device))
 
     def _setup_scene(self) -> None:
         self.proxy_robot = RigidObject(self.cfg.proxy_robot)
@@ -242,88 +243,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         quaternion = torch.zeros((env_ids.numel(), 4), device=self.device)
         quaternion[:, 0] = torch.cos(0.5 * yaw)
         quaternion[:, 3] = torch.sin(0.5 * yaw)
-        proxy_env_ids = torch.as_tensor(
-            env_ids,
-            device=self.device,
-            dtype=torch.long,
-        ).reshape(-1).contiguous()
-
-        position = position.to(
-            device=self.device,
-            dtype=torch.float32,
-        ).reshape(-1, 3)
-
-        quaternion = quaternion.to(
-            device=self.device,
-            dtype=torch.float32,
-        ).reshape(-1, 4)
-
-        quaternion_norm = torch.linalg.vector_norm(
-            quaternion,
-            dim=-1,
-            keepdim=True,
-        )
-
-        if torch.any(quaternion_norm < 1.0e-8):
-            raise RuntimeError("proxy_robot四元数模长接近0")
-
-        quaternion = quaternion / quaternion_norm
-
-        proxy_pose = torch.cat(
-            (position, quaternion),
-            dim=-1,
-        ).contiguous()
-
-        num_instances = int(self.proxy_robot.num_instances)
-
-        print(
-            "[PROXY POSE]",
-            f"num_instances={num_instances}",
-            f"env_ids={proxy_env_ids.detach().cpu().tolist()}",
-            f"pose_shape={tuple(proxy_pose.shape)}",
-            f"pose_device={proxy_pose.device}",
-            f"pose_dtype={proxy_pose.dtype}",
-            f"pose_finite={bool(torch.isfinite(proxy_pose).all().item())}",
-            flush=True,
-        )
-
-        if proxy_pose.shape != (proxy_env_ids.numel(), 7):
-            raise RuntimeError(
-                f"proxy_pose形状错误: {tuple(proxy_pose.shape)}, "
-                f"env_ids数量: {proxy_env_ids.numel()}"
-            )
-
-        if not torch.isfinite(proxy_pose).all():
-            raise RuntimeError("proxy_pose包含NaN或Inf")
-
-        if proxy_env_ids.numel() == 0:
-            raise RuntimeError("proxy_env_ids为空")
-
-        if int(proxy_env_ids.min().item()) < 0:
-            raise RuntimeError("proxy_env_ids包含负数")
-
-        if int(proxy_env_ids.max().item()) >= num_instances:
-            raise RuntimeError(
-                f"proxy_env_ids越界: max={int(proxy_env_ids.max().item())}, "
-                f"num_instances={num_instances}"
-            )
-
-        all_env_ids = torch.arange(
-            num_instances,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        if (
-            proxy_env_ids.numel() == num_instances
-            and torch.equal(proxy_env_ids, all_env_ids)
-        ):
-            self.proxy_robot.write_root_pose_to_sim(proxy_pose)
-        else:
-            self.proxy_robot.write_root_pose_to_sim(
-                proxy_pose,
-                env_ids=proxy_env_ids,
-            )
+        self.proxy_robot.write_root_pose_to_sim(torch.cat((position, quaternion), dim=-1), env_ids=env_ids)
 
     def _update_outcomes(self) -> None:
         raw_map, ground_reference_z = self.map_generator.generate(
@@ -422,18 +342,6 @@ class TerrainNavigationEnv(DirectRLEnv):
         return terminated, time_out
 
     def _get_rewards(self) -> torch.Tensor:
-        goal_delta = self.goal_xy - self.pose[:, :2]
-
-        goal_bearing_world = torch.atan2(
-            goal_delta[:, 1],
-            goal_delta[:, 0],
-        )
-
-        goal_bearing = torch.atan2(
-            torch.sin(goal_bearing_world - self.pose[:, 2]),
-            torch.cos(goal_bearing_world - self.pose[:, 2]),
-        )
-
         reward = navigation_reward(
             self.previous_distance,
             self.current_distance,
@@ -446,11 +354,8 @@ class TerrainNavigationEnv(DirectRLEnv):
             self.collision,
             self.unstable,
             self.stuck,
-            goal_bearing,
-            self.execution_model.actual_velocity,
             self.reward_weights,
         )
-
         self.previous_distance.copy_(self.current_distance)
         return reward
 
@@ -530,28 +435,14 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.bad_observation_steps[env_ids] = 0
         self.execution_model.reset(env_ids)
         self.map_generator.reset(env_ids, self.curriculum.levels[env_ids])
-
-        # 先确定机器人初始航向，再依据完整位姿生成目标。
-        heading_error = 0.7 * (
-            torch.rand(count, device=self.device) - 0.5
-        )
-        self.pose[env_ids, 2] = torch.atan2(
-            torch.sin(
-                self.map_generator.route_yaw[env_ids]
-                + heading_error
-            ),
-            torch.cos(
-                self.map_generator.route_yaw[env_ids]
-                + heading_error
-            ),
-        )
-
         self.goal_xy[env_ids] = self.map_generator.sample_task_goals(
             self.pose[env_ids],
             self.cfg.local_goal_minimum_m,
             self.cfg.local_goal_maximum_m,
             env_ids,
         )
+        heading_error = 0.7 * (torch.rand(count, device=self.device) - 0.5)
+        self.pose[env_ids, 2] = self.map_generator.route_yaw[env_ids] + heading_error
         generated_map, ground_reference_z = self.map_generator.generate(
             self.pose[env_ids],
             self.execution_model.actual_velocity[env_ids],

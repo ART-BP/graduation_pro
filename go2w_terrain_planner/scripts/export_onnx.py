@@ -7,6 +7,11 @@ from pathlib import Path
 
 import torch
 
+import os
+
+# ONNX export only needs the PyTorch model and must not import Isaac Sim tasks.
+os.environ.setdefault("GO2W_SKIP_TASK_IMPORT", "1")
+
 from go2w_terrain_planner.models import ActorExportWrapper, Go2wActorCritic
 from go2w_terrain_planner.utils.config_loader import load_project_config
 

@@ -1,15 +1,22 @@
 reward:
-  progress: 4.0
-  goal_reached: 15.0
+  progress: 8.0
+  goal_reached: 20.0
   collision: -20.0
   unstable: -15.0
   stuck: -5.0
-  linear_action_rate: -0.05
-  angular_action_rate: -0.03
+
+  heading: 0.05
+  forward_to_goal: 0.25
+
+  linear_action_rate: -0.02
+  angular_action_rate: -0.02
+  angular_speed: -0.08
+  spin: -0.25
+
   time: -0.01
-  path_length: -0.02
+  path_length: 0.0
   action_limit_violation: -0.25
-  unknown_risk: -0.10
+  unknown_risk: -0.02
 termination:
   goal_tolerance_m: 0.35
   collision_height_range_m: 0.45

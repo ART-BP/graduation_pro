@@ -84,169 +84,29 @@ class Go2wActorCritic(nn.Module):
     def _group(self, obs, group: str) -> torch.Tensor:
         return torch.cat([obs[name] for name in self.obs_groups[group]], dim=-1)
 
-    def _check_finite_tensor(
-        self,
-        name: str,
-        tensor: torch.Tensor,
-        module: nn.Module | None = None,
-    ) -> None:
-        """Raise a detailed error when a tensor first becomes non-finite."""
-
-        # Do not inject diagnostic Python control flow into ONNX tracing.
-        if torch.jit.is_tracing():
-            return
-
-        finite_mask = torch.isfinite(tensor)
-
-        if bool(finite_mask.all().item()):
-            return
-
-        bad_mask = ~finite_mask
-        bad_count = int(bad_mask.sum().item())
-
-        first_bad_indices = (
-            torch.nonzero(bad_mask, as_tuple=False)[:8]
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        finite_values = tensor[finite_mask]
-
-        if finite_values.numel() > 0:
-            finite_min = float(finite_values.min().item())
-            finite_max = float(finite_values.max().item())
-            finite_max_abs = float(finite_values.abs().max().item())
-        else:
-            finite_min = float("nan")
-            finite_max = float("nan")
-            finite_max_abs = float("nan")
-
-        bad_parameters: list[str] = []
-
-        if module is not None:
-            for parameter_name, parameter in module.named_parameters():
-                if not bool(torch.isfinite(parameter).all().item()):
-                    bad_parameters.append(parameter_name)
-
-        raise RuntimeError(
-            f"Actor张量出现NaN或Inf: stage={name}, "
-            f"shape={tuple(tensor.shape)}, "
-            f"dtype={tensor.dtype}, "
-            f"device={tensor.device}, "
-            f"bad_count={bad_count}, "
-            f"first_bad_indices={first_bad_indices}, "
-            f"finite_min={finite_min}, "
-            f"finite_max={finite_max}, "
-            f"finite_max_abs={finite_max_abs}, "
-            f"bad_parameters={bad_parameters}"
-        )
-
     def _actor_raw_mean(self, actor_obs: torch.Tensor) -> torch.Tensor:
-        self._check_finite_tensor(
-            "policy_observation",
-            actor_obs,
-        )
-
         batch = actor_obs.shape[0]
-
-        map_observation = actor_obs[:, : self.map_flat_dim]
+        maps = actor_obs[:, : self.map_flat_dim].reshape(
+            batch, self.map_history_length, self.map_channels, self.map_size, self.map_size
+        )
         auxiliary = actor_obs[:, self.map_flat_dim :]
-
-        self._check_finite_tensor(
-            "map_observation",
-            map_observation,
-        )
-        self._check_finite_tensor(
-            "auxiliary_observation",
-            auxiliary,
-        )
-
-        maps = map_observation.reshape(
-            batch,
-            self.map_history_length,
-            self.map_channels,
-            self.map_size,
-            self.map_size,
-        )
-
-        map_encoder_input = maps.reshape(
-            -1,
-            self.map_channels,
-            self.map_size,
-            self.map_size,
-        )
-
-        self._check_finite_tensor(
-            "map_encoder_input",
-            map_encoder_input,
-        )
-
-        per_frame = self.map_encoder(map_encoder_input)
-
-        self._check_finite_tensor(
-            "map_encoder_output",
-            per_frame,
-            self.map_encoder,
-        )
-
-        per_frame = per_frame.reshape(
-            batch,
-            self.map_history_length,
-            -1,
-        )
-
-        self._check_finite_tensor(
-            "temporal_encoder_input",
-            per_frame,
-        )
-
+        per_frame = self.map_encoder(maps.reshape(-1, self.map_channels, self.map_size, self.map_size))
+        per_frame = per_frame.reshape(batch, self.map_history_length, -1)
         temporal = self.temporal_encoder(per_frame)
-
-        self._check_finite_tensor(
-            "temporal_encoder_output",
-            temporal,
-            self.temporal_encoder,
-        )
-
         auxiliary_feature = self.auxiliary_encoder(auxiliary)
-
-        self._check_finite_tensor(
-            "auxiliary_encoder_output",
-            auxiliary_feature,
-            self.auxiliary_encoder,
-        )
-
-        fused_feature = torch.cat(
-            (temporal, auxiliary_feature),
-            dim=-1,
-        )
-
-        self._check_finite_tensor(
-            "actor_fused_feature",
-            fused_feature,
-        )
-
-        mean = self.actor_head(fused_feature)
-
-        self._check_finite_tensor(
-            "actor_head_output",
-            mean,
-            self.actor_head,
-        )
-
-        return mean
+        return self.actor_head(torch.cat((temporal, auxiliary_feature), dim=-1))
 
     def _actor_forward(self, actor_obs: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self._actor_raw_mean(actor_obs))
 
     def _update_distribution(self, obs) -> None:
-        policy_observation = self._group(obs, "policy")
+        mean = self._actor_raw_mean(self._group(obs, "policy"))
 
-        mean = self._actor_raw_mean(policy_observation)
+        if not torch.isfinite(mean).all():
+            raise RuntimeError("Actor动作均值包含NaN或Inf")
 
-        # Directly optimized std can become negative or non-finite.
-        # Repair only the distribution parameter, never the Actor mean.
+        # self.std是直接参与优化的Parameter。负数可由clamp处理，
+        # 但NaN不会被clamp修复，因此先原地恢复非有限值。
         with torch.no_grad():
             self.std.nan_to_num_(
                 nan=0.2,
@@ -260,15 +120,10 @@ class Go2wActorCritic(nn.Module):
 
         std = self.std.expand_as(mean)
 
-        self._check_finite_tensor(
-            "action_std",
-            std,
-        )
-
-        if bool(torch.any(std <= 0.0).item()):
+        if not torch.isfinite(std).all():
             raise RuntimeError(
-                "Actor动作标准差不是正数: "
-                f"std={self.std.detach().cpu().tolist()}"
+                f"Actor动作标准差包含NaN或Inf: "
+                f"{self.std.detach().cpu().tolist()}"
             )
 
         self.distribution = Normal(mean, std)

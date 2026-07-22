@@ -17,18 +17,16 @@ ppo:
   entropy_coef: 0.005
   num_learning_epochs: 5
   num_mini_batches: 4
-  learning_rate: 5.0e-05
-  schedule: fixed
+  learning_rate: 0.0003
+  schedule: adaptive
   gamma: 0.99
   lam: 0.95
   desired_kl: 0.01
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
 model:
   map_feature_dim: 128
   temporal_hidden_dim: 128
   auxiliary_hidden_dim: 64
   fusion_hidden_dim: 128
   initial_action_std: 0.5
-  critic_hidden_dims:
-  - 128
-  - 128
+  critic_hidden_dims: [128, 128]

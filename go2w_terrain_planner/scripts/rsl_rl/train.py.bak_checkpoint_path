@@ -118,7 +118,6 @@ from go2w_terrain_planner.models import Go2wActorCritic
 from go2w_terrain_planner.utils.config_loader import apply_project_config, load_project_config
 from go2w_terrain_planner.utils.config_loader import default_config_directory
 from go2w_terrain_planner.utils.logging_utils import mirror_latest_checkpoint, prepare_run_directory
-from pathlib import Path
 
 # RSL-RL 3.1.2 resolves policy class names in on_policy_runner.py globals.
 # Isaac Lab 2.3.2 pins that release, so register the external model explicitly.
@@ -208,21 +207,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        checkpoint_value = str(agent_cfg.load_checkpoint)
-        checkpoint_path = Path(checkpoint_value).expanduser()
-
-        if checkpoint_path.is_absolute():
-            if not checkpoint_path.is_file():
-                raise FileNotFoundError(
-                    f"Checkpoint文件不存在: {checkpoint_path}"
-                )
-            resume_path = str(checkpoint_path)
-        else:
-            resume_path = get_checkpoint_path(
-                log_root_path,
-                agent_cfg.load_run,
-                agent_cfg.load_checkpoint,
-            )
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -254,27 +239,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path, load_optimizer=False)
+        runner.load(resume_path)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    # Random episode phases are useful only for training from scratch.
-    # Re-randomizing episode lengths after loading a checkpoint abruptly
-    # changes timeout/return distributions and can destabilize PPO updates.
-    init_at_random_ep_len = not bool(args_cli.resume)
-
-    print(
-        f"[INFO] init_at_random_ep_len={init_at_random_ep_len}",
-        flush=True,
-    )
-
-    runner.learn(
-        num_learning_iterations=agent_cfg.max_iterations,
-        init_at_random_ep_len=init_at_random_ep_len,
-    )
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
     final_iteration = getattr(runner, "current_learning_iteration", agent_cfg.max_iterations)
     runner.save(os.path.join(log_dir, f"model_{final_iteration}.pt"))
     latest_checkpoint = mirror_latest_checkpoint(log_dir)

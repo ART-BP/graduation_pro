@@ -15,4 +15,13 @@ if (
     os.environ.get("GO2W_SKIP_TASK_REGISTRATION") != "1"
     and importlib.util.find_spec("isaaclab_tasks") is not None
 ):
+    import os
+
+# Training/play/evaluation require task registration, while standalone
+# model export and ONNX verification must not import Isaac Sim modules.
+if os.environ.get(
+    "GO2W_SKIP_TASK_IMPORT",
+    "0",
+).strip().lower() not in {"1", "true", "yes"}:
     from .tasks import *
+

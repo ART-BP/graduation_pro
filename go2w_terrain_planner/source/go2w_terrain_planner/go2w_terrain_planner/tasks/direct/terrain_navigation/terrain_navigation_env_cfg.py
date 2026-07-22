@@ -22,14 +22,14 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
         num_envs=32,
         env_spacing=12.0,
         replicate_physics=True,
-        clone_in_fabric=True,
+        clone_in_fabric=False,
     )
     proxy_robot: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.CuboidCfg(
             size=(0.70, 0.40, 0.25),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
+                kinematic_enabled=False,
                 disable_gravity=True,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -48,7 +48,7 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
     minimum_height_valid_ratio = 0.005
     local_goal_minimum_m = 1.5
     local_goal_maximum_m = 4.0
-    goal_tolerance_m = 0.35
+    goal_tolerance_m = 0.50
     maximum_distance_m = 8.0
     collision_height_range_m = 0.45
     unstable_risk_threshold = 0.20

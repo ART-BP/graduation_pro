@@ -24,7 +24,7 @@ case "${COMMAND}" in
         ;;
     play)
         run_python "${PROJECT_ROOT}/scripts/rsl_rl/play.py" \
-            --task Go2W-Terrain-Navigation-Direct-v0 --headless "$@"
+            --task Go2W-Terrain-Navigation-Direct-v0  "$@"
         ;;
     evaluate)
         run_python "${PROJECT_ROOT}/scripts/evaluate.py" \
