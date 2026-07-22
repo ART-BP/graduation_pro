@@ -1,0 +1,35 @@
+Task: Go2W-Terrain-Navigation-Direct-v0
+Model: model_2499.pt
+Training seed: 44
+Training iterations: 2500
+
+Evaluation seed 42:
+  success rate: 97.5347%
+
+Evaluation seed 101:
+  success rate: 97.2635%
+  mean return: 929.0021
+  terminations: 1279
+
+Evaluation seed 102:
+  success rate: 96.9650%
+  mean return: 923.6057
+  terminations: 1285
+
+Evaluation seed 103:
+  success rate: 97.3623%
+  mean return: 938.6234
+  terminations: 1289
+
+Four-seed mean success rate: approximately 97.28%
+Minimum success rate: approximately 96.96%
+
+ONNX interface:
+  input: policy_observation [batch, 200025]
+  output: velocity_command [batch, 2]
+
+ONNX Runtime CPU latency:
+  mean: 2.486 ms
+  median: 1.097 ms
+  p95: 5.436 ms
+  max: 11.667 ms

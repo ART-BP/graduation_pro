@@ -1,0 +1,22 @@
+{
+  "created_at_utc": "2026-07-21T19:35:23.013694+00:00",
+  "seed": 44,
+  "git_commit": "local-gui-fix",
+  "git_dirty": null,
+  "docker_image_version": "0.1.0",
+  "isaac_lab_version": "0.54.2",
+  "isaac_sim_version": "5.1.0",
+  "rsl_rl_version": "3.1.2",
+  "command_line": [
+    "/workspace/go2w_terrain_planner/scripts/rsl_rl/train.py",
+    "--task",
+    "Go2W-Terrain-Navigation-Direct-v0",
+    "--headless",
+    "--num_envs",
+    "32",
+    "--seed",
+    "44",
+    "--max_iterations",
+    "2500"
+  ]
+}

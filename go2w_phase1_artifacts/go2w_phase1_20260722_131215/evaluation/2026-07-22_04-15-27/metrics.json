@@ -1,0 +1,11 @@
+{
+  "task": "Go2W-Terrain-Navigation-Direct-v0",
+  "checkpoint": "/workspace/data/runs/rsl_rl/go2w_terrain_navigation/2026-07-21_19-35-23_phase1_proxy/model_2499.pt",
+  "seed": 102,
+  "num_envs": 32,
+  "steps_per_env": 2000,
+  "mean_return_over_window": 923.605712890625,
+  "terminations": 1285,
+  "estimated_success_rate": 0.9696498056098181,
+  "environment_steps_per_second": 418.7505307748422
+}

@@ -1,0 +1,127 @@
+[
+    {
+        "Id": "sha256:064c10deab0ba3df88702b492fd340940a5eaf2de0cd6ed374a6a857d1f6c8f5",
+        "RepoTags": [
+            "go2w-terrain-planner:0.1.0"
+        ],
+        "RepoDigests": [
+            "go2w-terrain-planner@sha256:064c10deab0ba3df88702b492fd340940a5eaf2de0cd6ed374a6a857d1f6c8f5"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-07-22T03:14:18.164804774+08:00",
+        "Config": {
+            "User": "root",
+            "ExposedPorts": {
+                "47998/udp": {},
+                "49100/tcp": {}
+            },
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NVIDIA_VISIBLE_DEVICES=all",
+                "NVIDIA_DRIVER_CAPABILITIES=all",
+                "VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json",
+                "OMNI_SERVER=https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1",
+                "MIN_DRIVER_VERSION=570.169",
+                "ISAACSIM_VERSION=",
+                "ISAACSIM_ROOT_PATH=/isaac-sim",
+                "ISAACLAB_PATH=/workspace/isaaclab",
+                "DOCKER_USER_HOME=/root",
+                "LANG=C.UTF-8",
+                "DEBIAN_FRONTEND=noninteractive",
+                "PYTHONUNBUFFERED=1",
+                "PYTHONDONTWRITEBYTECODE=1",
+                "PIP_DISABLE_PIP_VERSION_CHECK=1",
+                "GO2W_PROJECT_ROOT=/workspace/go2w_terrain_planner",
+                "GO2W_DATA_ROOT=/workspace/data",
+                "GO2W_IMAGE_VERSION=0.1.0",
+                "GO2W_GIT_COMMIT=local-gui-fix",
+                "ISAAC_LAB_VERSION=2.3.2",
+                "ISAAC_SIM_VERSION=5.1.0"
+            ],
+            "Entrypoint": [
+                "/usr/local/bin/go2w-entrypoint"
+            ],
+            "Cmd": [
+                "shell"
+            ],
+            "WorkingDir": "/workspace/go2w_terrain_planner",
+            "Labels": {
+                "com.nvidia.isaac.lab.version": "2.3.2",
+                "com.nvidia.isaac.sim.version": "5.1.0",
+                "description": "Dockerfile for building and running the Isaac Lab framework inside Isaac Sim container image.",
+                "org.opencontainers.image.ref.name": "ubuntu",
+                "org.opencontainers.image.revision": "local-gui-fix",
+                "org.opencontainers.image.title": "Go2W Terrain Planner",
+                "org.opencontainers.image.version": "0.1.0",
+                "version": "2.1.1"
+            },
+            "ArgsEscaped": true,
+            "Shell": [
+                "/bin/bash",
+                "-c"
+            ]
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 8425777090,
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:45a01f98e78ce09e335b30d7a3080eecab7f50dfa0b38ca44a9dee2654ac0530",
+                "sha256:557d58392f0d4e1d2a87619a52312212173a48c8c01985e858102cadc4ef4a25",
+                "sha256:cc1476b738172c2fd52c384507f2b2ebfe4ab413365b4494e9980f2e5c32e024",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:f4d3888c9dd47844a4b4b93a5e36b26189469099d3856382e203da938f170184",
+                "sha256:3399d435180dadc9669bf70bd2d00ea71e22b9b3e4ee7bcfdf88a2bc5c0333a5",
+                "sha256:fe6e6cc231c46c0a3478c7b1f78d7fd74992e2d3c576aec11121af92d6ce6ffb",
+                "sha256:fe55475141c603c68f0e8facfe35b0f955444e17469afe1939179be8f06b4f5f",
+                "sha256:abc223a39911e743b782ed69bb73b4857aa50a42819aa72d8e236887fe822498",
+                "sha256:c6a5dd91cd3da432f66ddc7e894d37551ebde22f3326c948385b63d605e41a98",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:beba190f04409cafb543c2d2916c9c70ca5f8c648a730a39ebb1acd457c5dffd",
+                "sha256:63345de776fdb7bedce13e72b4cddbf80af1e17e16fbcc9384e0eb8574fecda3",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:28fe06da533777fe3ffa3bae281b32fb26a9fa0cc790cfcc0e32c2af0f893a3c",
+                "sha256:8ef1378e13b39aaae83dbb040e53832938a4c28212907df5e2ee5289987ce757",
+                "sha256:05bb9b4bd5c99d894e27dc6a7014fe633447d049ba440fba08ba0e4885bae224",
+                "sha256:1328264a4ab465c988fe37f2b6e8b35df3d4d43aeafc412175af153b4ea6d31d",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:61e031a7371dbc42a4eb3953d9d79787b94f1f085daae7fe5233cd206df275b0",
+                "sha256:e8fdeb53fb0f322ccbde3fe8c3b8dde1f0f47c902ed82bb2989a6d976eabaccc",
+                "sha256:1979c00e64a755447b15963e093ba62d6a4020a707d271098ea5458464c2ee71",
+                "sha256:3b9cfdaeb2a72c85adeb5be16bb0aa5848387c97d6d6a1acad257730b1347ff5",
+                "sha256:57dd1329d08a60958e433a7b69b60a2541e7afe9f0a268a430958454d749293c",
+                "sha256:9d6c6a7a6b72bec3fff2371a7d60ada908632dd572ca3a38e30ccf7188588b28",
+                "sha256:178ad9be870e8f7de107235f297360dd029331e3c6ffaa804fe9b58675e0a5d1",
+                "sha256:4d68a09df714bc21ecf8402807e77b7f0b4addd9028a06e19a803ab010fdab0b",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:7b66e90b070c533ed2972c33af7e2a7d17a21e414691b5738cbf3401615bf9de",
+                "sha256:5c7017dd4cdd1c326f2e4596e0b9d504fd017d5bf91cba256a4e62b67e704f28",
+                "sha256:da9b9ce272d9f867b07c79d862f0de3f97654d048368064cf26d6b8aabaaf915",
+                "sha256:66e6eec853c2c7dce8e5b68dd6a7aee9024fe9982fe182cf4151e26d73a1da4b",
+                "sha256:64876f517456c0f4e9c883ce4bc0aff50e8fa640c56311a3d3c165b3ca420487",
+                "sha256:81e63ce601727e86bee5063fe4d3a4608068d20f06f6d03d024ff6955fdc48d4",
+                "sha256:fc4b3b0225baa7620adbd7da6133888c30c230f3fecca8057b9c9d4e9522f382",
+                "sha256:0dbda5e9f25ddb7ef0c7b6c38e12abf79cd42ad9ba6a75e7dbd0f2c2bdcfa5e1",
+                "sha256:2d099b45bea6e9cd5031299064f70f73dd4fc07bd63c51765ba8a0af875cf2de"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "2026-07-21T19:14:20.936209568Z"
+        },
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:064c10deab0ba3df88702b492fd340940a5eaf2de0cd6ed374a6a857d1f6c8f5",
+            "size": 856
+        },
+        "Identity": {
+            "Build": [
+                {
+                    "Ref": "zla8eznosvj7yg5esxel7q8lp",
+                    "CreatedAt": "2026-07-22T03:14:21.39287317+08:00"
+                }
+            ]
+        }
+    }
+]

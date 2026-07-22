@@ -1,0 +1,21 @@
+map:
+  extent_m: 10.0
+  source_resolution_m: 0.05
+  source_size: 200
+  output_size: 100
+  history_length: 5
+  observation_fusion_length: 5
+  channels: 4
+  ground_fill_value: 0.0
+  range_fill_value: 0.0
+  max_abs_relative_height_m: 1.5
+  max_height_range_m: 3.0
+  normalize_heights: true
+  minimum_observed_ratio: 0.01
+  minimum_height_valid_ratio: 0.005
+goal:
+  minimum_distance_m: 1.5
+  maximum_distance_m: 4.0
+history:
+  command_length: 4
+  motion_length: 4

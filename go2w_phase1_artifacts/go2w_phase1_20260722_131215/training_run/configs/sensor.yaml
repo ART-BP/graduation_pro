@@ -1,0 +1,10 @@
+sensor:
+  height_noise_std_m: 0.015
+  range_noise_std_m: 0.010
+  random_missing_probability: 0.03
+  ray_only_probability: 0.02
+  occlusion_sector_probability: 0.30
+  occlusion_width_range_rad: [0.10, 0.50]
+  pose_xy_noise_std_m: 0.015
+  pose_yaw_noise_std_rad: 0.01
+  time_jitter_std_s: 0.005
