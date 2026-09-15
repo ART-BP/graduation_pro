@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from go2w_terrain_planner.utils.tensor_checks import require_finite
+
 
 def _validate_parameters(max_abs_relative_height: float, max_height_range: float) -> None:
     if max_abs_relative_height <= 0.0:
@@ -111,8 +113,7 @@ def preprocess_grid_map_torch(
     clean_range = torch.where(valid, clean_range, torch.full_like(clean_range, range_fill_value))
     observed = torch.nan_to_num(observed, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
     output = torch.stack((relative, clean_range, observed, valid.float()), dim=-3)
-    if not torch.isfinite(output).all():
-        raise RuntimeError("PyTorch地图预处理结果包含NaN或Inf")
+    require_finite(output, "PyTorch地图预处理结果")
     return output
 
 

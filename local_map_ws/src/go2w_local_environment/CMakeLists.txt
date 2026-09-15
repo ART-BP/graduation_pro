@@ -6,7 +6,6 @@ add_compile_options(-std=c++14 -Wall -Wextra -Wpedantic)
 find_package(catkin REQUIRED COMPONENTS
   grid_map_core
   grid_map_msgs
-  grid_map_ros
   geometry_msgs
   message_filters
   nav_msgs
@@ -20,11 +19,10 @@ find_package(Threads REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES elevation_projector
+  LIBRARIES elevation_projector grid_map_message_converter
   CATKIN_DEPENDS
     grid_map_core
     grid_map_msgs
-    grid_map_ros
     geometry_msgs
     message_filters
     nav_msgs
@@ -44,6 +42,16 @@ add_library(elevation_projector
   src/elevation_projector.cpp
 )
 
+add_library(grid_map_message_converter
+  src/grid_map_message_converter.cpp
+)
+add_dependencies(grid_map_message_converter
+  ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(grid_map_message_converter
+  ${catkin_LIBRARIES}
+)
+
 add_executable(local_environment_node
   src/local_environment_node.cpp
 )
@@ -52,8 +60,8 @@ add_dependencies(local_environment_node
 )
 target_link_libraries(local_environment_node
   elevation_projector
-  ${grid_map_ros_LIBRARIES}
-  ${roscpp_LIBRARIES}
+  grid_map_message_converter
+  ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
   Threads::Threads
 )
@@ -65,12 +73,16 @@ if(CATKIN_ENABLE_TESTING)
   if(TARGET test_elevation_projector)
     target_link_libraries(test_elevation_projector
       elevation_projector
+      grid_map_message_converter
       ${catkin_LIBRARIES}
     )
   endif()
 endif()
 
-install(TARGETS elevation_projector local_environment_node
+install(TARGETS
+  elevation_projector
+  grid_map_message_converter
+  local_environment_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

@@ -20,6 +20,15 @@ def test_goal_encoding_in_robot_frame() -> None:
     assert encoded[0, 2].item() == pytest.approx(1.0, abs=1e-6)
 
 
+def test_goal_encoding_covers_zero_to_ten_meters() -> None:
+    pose = torch.zeros((3, 3))
+    goal = torch.tensor([[0.0, 0.0], [10.0, 0.0], [12.0, 0.0]])
+
+    encoded = encode_local_goal(pose, goal, maximum_distance=10.0)
+
+    assert encoded[:, 0].tolist() == pytest.approx([0.0, 1.0, 1.0])
+
+
 def test_relative_pose_delta_uses_previous_body_frame() -> None:
     poses = torch.tensor([[[0.0, 0.0, torch.pi / 2], [0.0, 1.0, torch.pi / 2]]])
     motion = relative_pose_deltas(poses)

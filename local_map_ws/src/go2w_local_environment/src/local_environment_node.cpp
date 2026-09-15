@@ -1,4 +1,5 @@
 #include "go2w_local_environment/elevation_projector.hpp"
+#include "go2w_local_environment/grid_map_message_converter.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +23,6 @@
 #include <grid_map_core/iterators/CircleIterator.hpp>
 #include <grid_map_core/iterators/LineIterator.hpp>
 #include <grid_map_msgs/GridMap.h>
-#include <grid_map_ros/GridMapRosConverter.hpp>
 #include <geometry_msgs/PointStamped.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
@@ -40,11 +40,19 @@ namespace {
 constexpr char kGroundHeight[] = "ground_height";
 constexpr char kHeightRange[] = "height_range";
 constexpr char kObservedMask[] = "observed_mask";
+constexpr char kRayObservedMask[] = "ray_observed_mask";
+constexpr char kHeightMeasuredMask[] = "height_measured_mask";
+constexpr char kHeightInferredMask[] = "height_inferred_mask";
+constexpr char kHeightValidMask[] = "height_valid_mask";
 
 const std::vector<std::string> kPublishedLayers{
     kGroundHeight,
     kHeightRange,
     kObservedMask,
+    kRayObservedMask,
+    kHeightMeasuredMask,
+    kHeightInferredMask,
+    kHeightValidMask,
 };
 
 float quietNaN() {
@@ -114,6 +122,7 @@ class LocalEnvironmentNode {
         << input_crop_length_y_ << " m"
         << ", history=" << history_length_ << " frames"
         << ", elevation_ttl=" << elevation_stale_after_ << " s"
+        << ", dynamic_ttl=" << dynamic_elevation_stale_after_ << " s"
         << ", ray_ttl=" << ray_stale_after_ << " s"
         << ", imu_to_ground=" << imu_to_ground_height_ << " m");
   }
@@ -176,6 +185,14 @@ class LocalEnvironmentNode {
         private_node_,
         "projection/ground_percentile",
         parameters.ground_percentile);
+    loadParameter(
+        private_node_,
+        "projection/span_lower_percentile",
+        parameters.span_lower_percentile);
+    loadParameter(
+        private_node_,
+        "projection/span_upper_percentile",
+        parameters.span_upper_percentile);
 
     int minimum_points =
         static_cast<int>(parameters.minimum_points_per_cell);
@@ -243,6 +260,36 @@ class LocalEnvironmentNode {
     loadParameter(
         private_node_, "fusion/robot_history_keep_radius",
         robot_history_keep_radius_);
+    int minimum_confirming_frames = static_cast<int>(
+        fusion_parameters_.minimum_confirming_frames);
+    int reliable_frame_minimum_points = static_cast<int>(
+        fusion_parameters_.reliable_frame_minimum_points);
+    int flat_clear_confirmation_frames = static_cast<int>(
+        fusion_parameters_.flat_clear_confirmation_frames);
+    loadParameter(
+        private_node_, "fusion/minimum_confirming_frames",
+        minimum_confirming_frames);
+    loadParameter(
+        private_node_, "fusion/reliable_frame_minimum_points",
+        reliable_frame_minimum_points);
+    loadParameter(
+        private_node_, "fusion/maximum_ground_deviation",
+        fusion_parameters_.maximum_ground_deviation);
+    loadParameter(
+        private_node_, "fusion/span_percentile",
+        fusion_parameters_.span_percentile);
+    loadParameter(
+        private_node_, "fusion/dynamic_span_threshold",
+        fusion_parameters_.dynamic_span_threshold);
+    loadParameter(
+        private_node_, "fusion/flat_span_threshold",
+        fusion_parameters_.flat_span_threshold);
+    loadParameter(
+        private_node_, "fusion/flat_clear_confirmation_frames",
+        flat_clear_confirmation_frames);
+    loadParameter(
+        private_node_, "fusion/dynamic_elevation_stale_after",
+        dynamic_elevation_stale_after_);
     int expiration_cells_per_frame = static_cast<int>(
         expiration_cells_per_frame_);
     loadParameter(
@@ -252,6 +299,18 @@ class LocalEnvironmentNode {
       throw std::runtime_error(
           "fusion/history_length must be positive");
     }
+    if (minimum_confirming_frames <= 0 ||
+        reliable_frame_minimum_points <= 0 ||
+        flat_clear_confirmation_frames <= 0) {
+      throw std::runtime_error(
+          "fusion confirmation counts must be positive");
+    }
+    fusion_parameters_.minimum_confirming_frames =
+        static_cast<std::size_t>(minimum_confirming_frames);
+    fusion_parameters_.reliable_frame_minimum_points =
+        static_cast<std::size_t>(reliable_frame_minimum_points);
+    fusion_parameters_.flat_clear_confirmation_frames =
+        static_cast<std::size_t>(flat_clear_confirmation_frames);
     if (expiration_cells_per_frame <= 0) {
       throw std::runtime_error(
           "fusion/expiration_cells_per_frame must be positive");
@@ -339,6 +398,17 @@ class LocalEnvironmentNode {
       throw std::runtime_error(
           "fusion elevation/ray stale times must be positive");
     }
+    if (dynamic_elevation_stale_after_ <= 0.0 ||
+        dynamic_elevation_stale_after_ > elevation_stale_after_ ||
+        fusion_parameters_.maximum_ground_deviation <= 0.0F ||
+        fusion_parameters_.span_percentile < 0.0 ||
+        fusion_parameters_.span_percentile > 1.0 ||
+        fusion_parameters_.flat_span_threshold < 0.0F ||
+        fusion_parameters_.dynamic_span_threshold <=
+            fusion_parameters_.flat_span_threshold) {
+      throw std::runtime_error(
+          "fusion robust-estimation parameters are invalid");
+    }
     if (robot_history_keep_radius_ < 0.0) {
       throw std::runtime_error(
           "fusion/robot_history_keep_radius must not be negative");
@@ -393,6 +463,10 @@ class LocalEnvironmentNode {
     map_[kGroundHeight].setConstant(quietNaN());
     map_[kHeightRange].setConstant(quietNaN());
     map_[kObservedMask].setZero();
+    map_[kRayObservedMask].setZero();
+    map_[kHeightMeasuredMask].setZero();
+    map_[kHeightInferredMask].setZero();
+    map_[kHeightValidMask].setZero();
     for (IncrementalElevationCell& history : cell_histories_) {
       history.clear();
     }
@@ -494,8 +568,7 @@ class LocalEnvironmentNode {
     ground_reference_publisher_.publish(ground_reference_message);
     const ros::WallTime after_hole_filling = ros::WallTime::now();
     grid_map_msgs::GridMap message;
-    grid_map::GridMapRosConverter::toMessage(
-        published_map, kPublishedLayers, message);
+    toGridMapMessage(published_map, kPublishedLayers, message);
     grid_map_publisher_.publish(message);
     const ros::WallTime finish_time = ros::WallTime::now();
 
@@ -601,13 +674,20 @@ class LocalEnvironmentNode {
     clearElevation(index);
     last_ray_observed_seconds_[historyIndex(index)] =
         std::numeric_limits<double>::quiet_NaN();
-    map_.at(kObservedMask, index) = 0.0F;
+    refreshObservationLayers(index);
+  }
+
+  void invalidatePublishedHeight(const grid_map::Index& index) {
+    map_.at(kGroundHeight, index) = quietNaN();
+    map_.at(kHeightRange, index) = quietNaN();
+    map_.at(kHeightInferredMask, index) = 0.0F;
+    map_.at(kHeightValidMask, index) = 0.0F;
   }
 
   void clearElevation(const grid_map::Index& index) {
     const std::size_t linear_index = historyIndex(index);
-    map_.at(kGroundHeight, index) = quietNaN();
-    map_.at(kHeightRange, index) = quietNaN();
+    invalidatePublishedHeight(index);
+    map_.at(kHeightMeasuredMask, index) = 0.0F;
     cell_histories_[linear_index].clear();
     inferred_ground_height_[linear_index] = quietNaN();
     inferred_height_range_[linear_index] = quietNaN();
@@ -616,8 +696,6 @@ class LocalEnvironmentNode {
   void expireOldCells(
       const double current_stamp,
       const grid_map::Position& robot_position) {
-    const double oldest_elevation_stamp =
-        current_stamp - elevation_stale_after_;
     const double oldest_ray_stamp = current_stamp - ray_stale_after_;
     const double protected_radius_squared =
         robot_history_keep_radius_ * robot_history_keep_radius_;
@@ -631,8 +709,20 @@ class LocalEnvironmentNode {
       const grid_map::Index index = indexFromHistory(linear_index);
       IncrementalElevationCell& history =
           cell_histories_[linear_index];
+      const float current_span = map_.at(kHeightRange, index);
+      const bool dynamic_height_evidence =
+          std::isfinite(current_span) &&
+          current_span >= fusion_parameters_.dynamic_span_threshold;
+      const double elevation_ttl =
+          dynamic_height_evidence
+              ? dynamic_elevation_stale_after_
+              : elevation_stale_after_;
+      const double oldest_elevation_stamp =
+          current_stamp - elevation_ttl;
       bool protect_elevation_history = false;
-      if (!history.empty() && robot_history_keep_radius_ > 0.0) {
+      if (!dynamic_height_evidence &&
+          !history.empty() &&
+          robot_history_keep_radius_ > 0.0) {
         grid_map::Position cell_position;
         protect_elevation_history =
             map_.getPosition(index, cell_position) &&
@@ -644,7 +734,8 @@ class LocalEnvironmentNode {
         if (history.empty()) {
           clearElevation(index);
         } else {
-          writeFusedCell(index, history.fused());
+          writeFusedCell(
+              index, history.fused(fusion_parameters_));
         }
       }
 
@@ -655,7 +746,7 @@ class LocalEnvironmentNode {
         last_ray_observed =
             std::numeric_limits<double>::quiet_NaN();
       }
-      refreshObservedMask(index);
+      refreshObservationLayers(index);
     }
   }
 
@@ -679,6 +770,8 @@ class LocalEnvironmentNode {
           inferred_ground_height_[linear_index];
       output_map.at(kHeightRange, index) =
           inferred_height_range_[linear_index];
+      output_map.at(kHeightInferredMask, index) = 1.0F;
+      output_map.at(kHeightValidMask, index) = 1.0F;
       ++filled_cell_count;
     }
     return filled_cell_count;
@@ -1062,9 +1155,13 @@ class LocalEnvironmentNode {
       IncrementalElevationCell& history =
           cell_histories_[linear_index];
       history.add(
-          frame_measurement, stamp_seconds, history_length_);
+          frame_measurement,
+          stamp_seconds,
+          history_length_,
+          fusion_parameters_);
       const grid_map::Index index = indexFromHistory(linear_index);
-      writeFusedCell(index, history.fused());
+      writeFusedCell(
+          index, history.fused(fusion_parameters_));
       ++updated_cell_count;
       sample_begin = sample_end;
     }
@@ -1072,7 +1169,10 @@ class LocalEnvironmentNode {
     ROS_INFO_STREAM_ONCE(
         "Published first rolling elevation map. layers=["
         << kGroundHeight << ", " << kHeightRange << ", "
-        << kObservedMask << "], 15x15_cropped_points="
+        << kObservedMask << ", " << kRayObservedMask << ", "
+        << kHeightMeasuredMask << ", " << kHeightInferredMask
+        << ", " << kHeightValidMask
+        << "], 15x15_cropped_points="
         << cropped_point_count << ", integrated_points="
         << integrated_point_count << ", unique_rays="
         << unique_ray_count << ", ray_observed_cells="
@@ -1132,6 +1232,7 @@ class LocalEnvironmentNode {
         observed_this_frame[linear_index] = 1U;
         ++newly_observed_count;
         last_ray_observed_seconds_[linear_index] = stamp_seconds;
+        map_.at(kRayObservedMask, index) = 1.0F;
         map_.at(kObservedMask, index) = 1.0F;
       }
     } catch (const std::invalid_argument&) {
@@ -1145,26 +1246,40 @@ class LocalEnvironmentNode {
       const grid_map::Index& index,
       const ElevationCell& elevation) {
     if (!elevation.observed) {
-      clearElevation(index);
-      refreshObservedMask(index);
+      // Keep provisional single-point history, but do not expose it as a
+      // valid ground surface until it has temporal or multi-point support.
+      invalidatePublishedHeight(index);
+      refreshObservationLayers(index);
       return;
     }
     map_.at(kGroundHeight, index) = elevation.ground_height;
     map_.at(kHeightRange, index) = elevation.height_range;
-    map_.at(kObservedMask, index) = 1.0F;
+    map_.at(kHeightInferredMask, index) = 0.0F;
+    map_.at(kHeightValidMask, index) = 1.0F;
     const std::size_t linear_index = historyIndex(index);
     inferred_ground_height_[linear_index] = quietNaN();
     inferred_height_range_[linear_index] = quietNaN();
+    refreshObservationLayers(index);
   }
 
-  void refreshObservedMask(const grid_map::Index& index) {
+  void refreshObservationLayers(const grid_map::Index& index) {
     const std::size_t linear_index = historyIndex(index);
-    const bool elevation_observed =
+    const bool height_measured =
         !cell_histories_[linear_index].empty();
     const bool ray_observed =
         std::isfinite(last_ray_observed_seconds_[linear_index]);
+    const bool height_valid =
+        std::isfinite(map_.at(kGroundHeight, index)) &&
+        std::isfinite(map_.at(kHeightRange, index));
+    map_.at(kRayObservedMask, index) =
+        ray_observed ? 1.0F : 0.0F;
+    map_.at(kHeightMeasuredMask, index) =
+        height_measured ? 1.0F : 0.0F;
+    map_.at(kHeightInferredMask, index) = 0.0F;
+    map_.at(kHeightValidMask, index) =
+        height_valid ? 1.0F : 0.0F;
     map_.at(kObservedMask, index) =
-        (elevation_observed || ray_observed) ? 1.0F : 0.0F;
+        (height_measured || ray_observed) ? 1.0F : 0.0F;
   }
 
   std::size_t historyIndex(const grid_map::Index& index) const {
@@ -1190,6 +1305,7 @@ class LocalEnvironmentNode {
   ros::NodeHandle node_;
   ros::NodeHandle private_node_;
   ElevationProjector projector_;
+  ElevationFusionParameters fusion_parameters_;
   ElevationHoleFillParameters hole_fill_parameters_;
   ElevationHoleFiller hole_filler_;
   GroundReferenceParameters ground_reference_parameters_;
@@ -1234,6 +1350,7 @@ class LocalEnvironmentNode {
   float ground_reference_maximum_cell_range_{0.15F};
   std::size_t history_length_{5U};
   double elevation_stale_after_{10.0};
+  double dynamic_elevation_stale_after_{2.0};
   double ray_stale_after_{1.0};
   double robot_history_keep_radius_{0.8};
   std::size_t expiration_cells_per_frame_{8000U};

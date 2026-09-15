@@ -16,8 +16,10 @@ from go2w_terrain_planner.mapping.grid_preprocessor import downsample_map_tensor
 from go2w_terrain_planner.mapping.simulated_local_map import (
     SimulatedLocalMap,
     SimulatedMapConfig,
+    TERRAIN_NAMES,
     fuse_aligned_map_history,
 )
+from go2w_terrain_planner.mapping.simulated_xt16_lidar import Xt16LidarConfig
 from go2w_terrain_planner.mapping.temporal_grid_buffer import TemporalGridBuffer
 from go2w_terrain_planner.robots.velocity_command_adapter import (
     ActionLimits,
@@ -26,11 +28,16 @@ from go2w_terrain_planner.robots.velocity_command_adapter import (
     VelocityExecutionModel,
 )
 from go2w_terrain_planner.utils.config_loader import load_project_config
+from go2w_terrain_planner.utils.tensor_checks import require_finite
 
 from .rewards import RewardWeights, navigation_reward
-from .curriculum import TerrainCurriculum
+from .curriculum import TerrainCurriculum, goal_distance_maximum_for_levels
 from .observations import assemble_policy_observation
-from .terminations import terrain_failure_state, termination_flags
+from .terminations import (
+    effective_terrain_entry_alignment,
+    terrain_failure_state,
+    termination_flags,
+)
 from .terrain_navigation_env_cfg import TerrainNavigationEnvCfg
 
 
@@ -58,12 +65,32 @@ class TerrainNavigationEnv(DirectRLEnv):
         )
         if actual != expected:
             raise ValueError(f"Isaac环境配置与项目YAML不一致：env={actual}, yaml={expected}")
+        sampling_maximum = (
+            cfg.curriculum_maximum_terrain_index
+            if cfg.terrain_sampling_maximum_index < 0
+            else cfg.terrain_sampling_maximum_index
+        )
+        if not (
+            0
+            <= cfg.terrain_sampling_minimum_index
+            <= sampling_maximum
+            <= cfg.curriculum_maximum_terrain_index
+        ):
+            raise ValueError("测试地形采样等级范围无效")
         self.pose = torch.zeros((self.num_envs, 3), device=self.device)
         self.goal_xy = torch.zeros((self.num_envs, 2), device=self.device)
         self.current_command = torch.zeros((self.num_envs, 2), device=self.device)
         self.previous_command = torch.zeros_like(self.current_command)
-        self.previous_distance = torch.zeros(self.num_envs, device=self.device)
         self.current_distance = torch.zeros(self.num_envs, device=self.device)
+        self.previous_navigation_potential = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.best_navigation_potential = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.current_navigation_potential = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self.path_increment = torch.zeros(self.num_envs, device=self.device)
         self.stuck_time = torch.zeros(self.num_envs, device=self.device)
         self.bad_observation_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -75,6 +102,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.stuck = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.out_of_bounds = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.observation_failure = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.time_out = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.terrain_risk = torch.zeros(self.num_envs, device=self.device)
         self.observed_terrain_risk = torch.zeros(self.num_envs, device=self.device)
         self.true_height_range_m = torch.zeros(self.num_envs, device=self.device)
@@ -83,6 +111,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.action_limit_violation = torch.zeros(self.num_envs, device=self.device)
 
         sensor_parameters = project_config["sensor"]
+        lidar_parameters = sensor_parameters["lidar"]
         terrain_parameters = project_config["terrain"]
         map_cfg = SimulatedMapConfig(
             extent_m=cfg.map_extent_m,
@@ -101,16 +130,73 @@ class TerrainNavigationEnv(DirectRLEnv):
             pose_xy_noise_std_m=float(sensor_parameters["pose_xy_noise_std_m"]),
             pose_yaw_noise_std_rad=float(sensor_parameters["pose_yaw_noise_std_rad"]),
             time_jitter_std_s=float(sensor_parameters["time_jitter_std_s"]),
+            observation_source=str(sensor_parameters["observation_source"]),
+            lidar_config=Xt16LidarConfig(
+                channels=int(lidar_parameters["channels"]),
+                vertical_angles_deg=tuple(
+                    float(value)
+                    for value in lidar_parameters["vertical_angles_deg"]
+                ),
+                horizontal_resolution_deg=float(
+                    lidar_parameters["horizontal_resolution_deg"]
+                ),
+                minimum_range_m=float(lidar_parameters["minimum_range_m"]),
+                maximum_range_m=float(lidar_parameters["maximum_range_m"]),
+                ray_step_m=float(lidar_parameters["ray_step_m"]),
+                mount_height_m=float(lidar_parameters["mount_height_m"]),
+                scan_frequency_hz=float(lidar_parameters["scan_frequency_hz"]),
+                motion_distortion=bool(lidar_parameters["motion_distortion"]),
+                ray_chunk_size=int(lidar_parameters["ray_chunk_size"]),
+                range_noise_std_m=float(sensor_parameters["range_noise_std_m"]),
+                height_noise_std_m=float(sensor_parameters["height_noise_std_m"]),
+                pose_xy_noise_std_m=float(sensor_parameters["pose_xy_noise_std_m"]),
+                pose_yaw_noise_std_rad=float(
+                    sensor_parameters["pose_yaw_noise_std_rad"]
+                ),
+                time_jitter_std_s=float(sensor_parameters["time_jitter_std_s"]),
+                beam_dropout_probability=float(
+                    sensor_parameters["random_missing_probability"]
+                ),
+                return_dropout_probability=float(
+                    sensor_parameters["ray_only_probability"]
+                ),
+            ),
             enabled_terrain_names=tuple(terrain_parameters["enabled_types"]),
             ramp_slope_range=tuple(terrain_parameters["ramp_slope_range"]),
             step_height_range_m=tuple(terrain_parameters["step_height_range_m"]),
             step_width_range_m=tuple(terrain_parameters["step_width_range_m"]),
             rough_amplitude_range_m=tuple(terrain_parameters["rough_amplitude_range_m"]),
             pit_depth_range_m=tuple(terrain_parameters["pit_depth_range_m"]),
+            pit_half_width_range_m=tuple(
+                terrain_parameters["pit_half_width_range_m"]
+            ),
+            pit_curriculum_start_depth_max_m=float(
+                terrain_parameters["pit_curriculum_start_depth_max_m"]
+            ),
+            pit_curriculum_start_half_width_max_m=float(
+                terrain_parameters["pit_curriculum_start_half_width_max_m"]
+            ),
+            pit_goal_clearance_m=float(
+                terrain_parameters["pit_goal_clearance_m"]
+            ),
             obstacle_height_range_m=tuple(terrain_parameters["obstacle_height_range_m"]),
+            barrier_half_width_range_m=tuple(
+                terrain_parameters["barrier_half_width_range_m"]
+            ),
+            challenge_barrier_width_scale=float(
+                terrain_parameters["challenge_barrier_width_scale"]
+            ),
+            barrier_navigation_clearance_m=float(
+                terrain_parameters["barrier_navigation_clearance_m"]
+            ),
             friction_range=tuple(terrain_parameters["friction_range"]),
         )
         self.map_generator = SimulatedLocalMap(self.num_envs, self.device, map_cfg)
+        print(
+            "[INFO] Local map observation source: "
+            f"{self.map_generator.cfg.observation_source}",
+            flush=True,
+        )
         self.temporal_buffer = TemporalGridBuffer(
             self.num_envs,
             cfg.map_history_length,
@@ -162,20 +248,84 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.terrain_tilt_gain_rad = float(execution_parameters["terrain_tilt_gain_rad"])
         self.entry_tilt_gain = float(execution_parameters["entry_tilt_gain"])
         self.reward_weights = RewardWeights(**project_config["reward"])
+        self.reward_term_sums = {
+            name: torch.zeros(self.num_envs, device=self.device)
+            for name in (
+                "progress",
+                "regression",
+                "heading",
+                "forward_to_goal",
+                "goal_reached",
+                "collision",
+                "unstable",
+                "stuck",
+                "timeout",
+                "out_of_bounds",
+                "observation_failure",
+                "linear_action_rate",
+                "angular_action_rate",
+                "angular_speed",
+                "spin",
+                "path_length",
+                "action_limit_violation",
+                "unknown_risk",
+                "terrain_speed_risk",
+                "time",
+            )
+        }
         curriculum_parameters = project_config["curriculum"]
+        self.frontier_sampling_probability = float(
+            curriculum_parameters["frontier_sampling_probability"]
+        )
+        self.challenge_sampling_probability = float(
+            curriculum_parameters["challenge_sampling_probability"]
+        )
+        self.challenge_level_span = int(
+            curriculum_parameters["challenge_level_span"]
+        )
+        self.curriculum_initial_level = int(
+            curriculum_parameters["initial_level"]
+        )
         self.curriculum = TerrainCurriculum(
             self.num_envs,
             self.device,
-            initial_level=int(curriculum_parameters["initial_level"]),
+            initial_level=self.curriculum_initial_level,
+            minimum_level=int(curriculum_parameters["minimum_level"]),
             maximum_level=int(curriculum_parameters["maximum_level"]),
             success_rate_up=float(curriculum_parameters["success_rate_up"]),
             success_rate_down=float(curriculum_parameters["success_rate_down"]),
             minimum_episodes_per_level=int(
                 curriculum_parameters["minimum_episodes_per_level"]
             ),
+            minimum_full_difficulty_episodes=int(
+                curriculum_parameters[
+                    "minimum_full_difficulty_episodes"
+                ]
+            ),
+            full_difficulty_threshold=float(
+                curriculum_parameters["full_difficulty_threshold"]
+            ),
+            smoothing=float(curriculum_parameters["success_rate_smoothing"]),
+            allow_level_demotion=bool(
+                curriculum_parameters["allow_level_demotion"]
+            ),
+        )
+        self.current_goal_sampling_maximum_m = torch.full(
+            (self.num_envs,),
+            cfg.local_goal_curriculum_start_maximum_m,
+            device=self.device,
         )
         self.current_map = torch.zeros(
             (self.num_envs, cfg.map_channels, cfg.map_size, cfg.map_size), device=self.device
+        )
+        self.terrain_episode_totals = torch.zeros(
+            len(TERRAIN_NAMES), dtype=torch.long, device=self.device
+        )
+        self.terrain_success_totals = torch.zeros_like(
+            self.terrain_episode_totals
+        )
+        self._all_env_ids = torch.arange(
+            self.num_envs, dtype=torch.long, device=self.device
         )
 
     def _setup_scene(self) -> None:
@@ -187,6 +337,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=1800.0, color=(0.8, 0.8, 0.8))
         light_cfg.func("/World/Light", light_cfg)
 
+    """接收网络动作"""
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         actions = torch.nan_to_num(actions, nan=0.0, posinf=2.0, neginf=-2.0)
         self.action_limit_violation = torch.relu(torch.abs(actions) - 1.0).square().sum(dim=-1)
@@ -194,6 +345,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.current_command.copy_(self.command_adapter.to_physical(actions))
         self.path_increment.zero_()
 
+    """ 执行运动 """
     def _apply_action(self) -> None:
         terrain_metrics = self.map_generator.true_motion_metrics(
             self.pose, self.current_command[:, 0]
@@ -206,10 +358,14 @@ class TerrainNavigationEnv(DirectRLEnv):
                 1.0,
             )
         )
+        effective_entry_alignment = effective_terrain_entry_alignment(
+            terrain_metrics.entry_alignment,
+            self.map_generator.terrain_type,
+        )
         blocked = (
             (terrain_metrics.maximum_discontinuity_m >= self.stuck_height_range_min_m)
             & (terrain_metrics.maximum_discontinuity_m < self.cfg.collision_height_range_m)
-            & (terrain_metrics.entry_alignment < self.poor_entry_alignment_threshold)
+            & (effective_entry_alignment < self.poor_entry_alignment_threshold)
             & (self.map_generator.friction < self.stuck_friction_threshold)
         )
         velocity = self.execution_model.step(
@@ -217,7 +373,7 @@ class TerrainNavigationEnv(DirectRLEnv):
             self.terrain_risk,
             self.map_generator.friction,
             self.physics_dt,
-            terrain_metrics.entry_alignment,
+            effective_entry_alignment,
             blocked,
         )
         yaw = self.pose[:, 2]
@@ -230,11 +386,15 @@ class TerrainNavigationEnv(DirectRLEnv):
             torch.cos(self.pose[:, 2] + velocity[:, 1] * self.physics_dt),
         )
         self.path_increment += torch.sqrt(dx.square() + dy.square())
-        self._write_proxy_pose()
 
     def _write_proxy_pose(self, env_ids: torch.Tensor | None = None) -> None:
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
+        write_all = env_ids is None
+        if write_all:
+            env_ids = self._all_env_ids
+        else:
+            env_ids = torch.as_tensor(
+                env_ids, device=self.device, dtype=torch.long
+            ).reshape(-1)
         position = torch.zeros((env_ids.numel(), 3), device=self.device)
         position[:, :2] = self.pose[env_ids, :2] + self.scene.env_origins[env_ids, :2]
         position[:, 2] = 0.20
@@ -242,89 +402,17 @@ class TerrainNavigationEnv(DirectRLEnv):
         quaternion = torch.zeros((env_ids.numel(), 4), device=self.device)
         quaternion[:, 0] = torch.cos(0.5 * yaw)
         quaternion[:, 3] = torch.sin(0.5 * yaw)
-        proxy_env_ids = torch.as_tensor(
-            env_ids,
-            device=self.device,
-            dtype=torch.long,
-        ).reshape(-1).contiguous()
-
-        position = position.to(
-            device=self.device,
-            dtype=torch.float32,
-        ).reshape(-1, 3)
-
-        quaternion = quaternion.to(
-            device=self.device,
-            dtype=torch.float32,
-        ).reshape(-1, 4)
-
-        quaternion_norm = torch.linalg.vector_norm(
-            quaternion,
-            dim=-1,
-            keepdim=True,
-        )
-
-        if torch.any(quaternion_norm < 1.0e-8):
-            raise RuntimeError("proxy_robot四元数模长接近0")
-
-        quaternion = quaternion / quaternion_norm
-
-        proxy_pose = torch.cat(
-            (position, quaternion),
-            dim=-1,
-        ).contiguous()
-
-        num_instances = int(self.proxy_robot.num_instances)
-
-        print(
-            "[PROXY POSE]",
-            f"num_instances={num_instances}",
-            f"env_ids={proxy_env_ids.detach().cpu().tolist()}",
-            f"pose_shape={tuple(proxy_pose.shape)}",
-            f"pose_device={proxy_pose.device}",
-            f"pose_dtype={proxy_pose.dtype}",
-            f"pose_finite={bool(torch.isfinite(proxy_pose).all().item())}",
-            flush=True,
-        )
-
-        if proxy_pose.shape != (proxy_env_ids.numel(), 7):
-            raise RuntimeError(
-                f"proxy_pose形状错误: {tuple(proxy_pose.shape)}, "
-                f"env_ids数量: {proxy_env_ids.numel()}"
-            )
-
-        if not torch.isfinite(proxy_pose).all():
-            raise RuntimeError("proxy_pose包含NaN或Inf")
-
-        if proxy_env_ids.numel() == 0:
-            raise RuntimeError("proxy_env_ids为空")
-
-        if int(proxy_env_ids.min().item()) < 0:
-            raise RuntimeError("proxy_env_ids包含负数")
-
-        if int(proxy_env_ids.max().item()) >= num_instances:
-            raise RuntimeError(
-                f"proxy_env_ids越界: max={int(proxy_env_ids.max().item())}, "
-                f"num_instances={num_instances}"
-            )
-
-        all_env_ids = torch.arange(
-            num_instances,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        if (
-            proxy_env_ids.numel() == num_instances
-            and torch.equal(proxy_env_ids, all_env_ids)
-        ):
+        proxy_pose = torch.cat((position, quaternion), dim=-1).contiguous()
+        require_finite(proxy_pose, "proxy_robot位姿")
+        if write_all:
             self.proxy_robot.write_root_pose_to_sim(proxy_pose)
         else:
             self.proxy_robot.write_root_pose_to_sim(
                 proxy_pose,
-                env_ids=proxy_env_ids,
+                env_ids=env_ids,
             )
 
+    """更新地图与状态"""
     def _update_outcomes(self) -> None:
         raw_map, ground_reference_z = self.map_generator.generate(
             self.pose,
@@ -347,6 +435,10 @@ class TerrainNavigationEnv(DirectRLEnv):
         terrain_metrics = self.map_generator.true_motion_metrics(
             self.pose, self.execution_model.actual_velocity[:, 0]
         )
+        effective_entry_alignment = effective_terrain_entry_alignment(
+            terrain_metrics.entry_alignment,
+            self.map_generator.terrain_type,
+        )
         self.true_height_range_m.copy_(terrain_metrics.hazard_height_m)
         (
             self.terrain_risk,
@@ -357,7 +449,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         ) = terrain_failure_state(
             terrain_metrics.collision_height_m,
             terrain_metrics.hazard_height_m,
-            terrain_metrics.entry_alignment,
+            effective_entry_alignment,
             self.current_command[:, 0],
             self.execution_model.actual_velocity[:, 0],
             collision_height_threshold_m=self.cfg.collision_height_range_m,
@@ -376,6 +468,12 @@ class TerrainNavigationEnv(DirectRLEnv):
             torch.zeros_like(self.stuck_time),
         )
         self.current_distance = torch.linalg.vector_norm(self.goal_xy - self.pose[:, :2], dim=-1)
+        self.current_navigation_potential.copy_(
+            self.map_generator.navigation_potential(
+                self.pose,
+                self.goal_xy,
+            )
+        )
         finite_map = torch.isfinite(self.current_map).flatten(1).all(dim=1)
         observed_ratio = self.current_map[:, 2].mean(dim=(-2, -1))
         height_valid_ratio = self.current_map[:, 3].mean(dim=(-2, -1))
@@ -407,6 +505,8 @@ class TerrainNavigationEnv(DirectRLEnv):
             maximum_distance_m=self.cfg.maximum_distance_m,
             maximum_bad_observation_steps=self.cfg.maximum_bad_observation_steps,
         )
+        # 代理刚体只承担可视化；每个策略步写一次即可，无需在每个物理子步同步。
+        self._write_proxy_pose()
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_outcomes()
@@ -418,9 +518,11 @@ class TerrainNavigationEnv(DirectRLEnv):
             | self.out_of_bounds
             | self.observation_failure
         )
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return terminated, time_out
-
+        self.time_out = (
+            self.episode_length_buf >= self.max_episode_length - 1
+        ) & ~terminated
+        return terminated, self.time_out
+    """计算奖励"""
     def _get_rewards(self) -> torch.Tensor:
         goal_delta = self.goal_xy - self.pose[:, :2]
 
@@ -434,9 +536,9 @@ class TerrainNavigationEnv(DirectRLEnv):
             torch.cos(goal_bearing_world - self.pose[:, 2]),
         )
 
-        reward = navigation_reward(
-            self.previous_distance,
-            self.current_distance,
+        reward, reward_terms = navigation_reward(
+            self.previous_navigation_potential,
+            self.current_navigation_potential,
             self.current_command,
             self.previous_command,
             self.path_increment,
@@ -449,11 +551,28 @@ class TerrainNavigationEnv(DirectRLEnv):
             goal_bearing,
             self.execution_model.actual_velocity,
             self.reward_weights,
+            best_distance=self.best_navigation_potential,
+            terrain_risk=self.terrain_risk,
+            time_out=self.time_out,
+            out_of_bounds=self.out_of_bounds,
+            observation_failure=self.observation_failure,
+            return_terms=True,
         )
+        for name, term in reward_terms.items():
+            self.reward_term_sums[name] += term
 
-        self.previous_distance.copy_(self.current_distance)
+        self.best_navigation_potential.copy_(
+            torch.minimum(
+                self.best_navigation_potential,
+                self.current_navigation_potential,
+            )
+        )
+        self.previous_navigation_potential.copy_(
+            self.current_navigation_potential
+        )
         return reward
 
+    """构建网络输入"""
     def _get_observations(self) -> dict[str, torch.Tensor]:
         self.temporal_buffer.push(
             self.current_map,
@@ -472,15 +591,26 @@ class TerrainNavigationEnv(DirectRLEnv):
             expected_dimension=self.cfg.observation_space,
         )
         goal_delta = self.goal_xy - self.pose[:, :2]
+        normalized_goal_delta = goal_delta / self.cfg.local_goal_maximum_m
         tracking_error = self.current_command - self.execution_model.actual_velocity
+        terrain_type = self.map_generator.terrain_type
+        privileged_geometry = torch.where(
+            terrain_type == TERRAIN_NAMES.index("wall"),
+            self.map_generator.barrier_half_width
+            / (0.5 * self.cfg.map_extent_m),
+            self.map_generator.amplitude,
+        )
         critic = torch.cat(
             (
-                goal_delta,
-                self.current_distance[:, None],
+                normalized_goal_delta,
+                (
+                    self.current_navigation_potential
+                    / self.cfg.local_goal_maximum_m
+                )[:, None],
                 self.execution_model.actual_velocity,
-                self.map_generator.terrain_type[:, None].float()
+                terrain_type[:, None].float()
                 / max(1, self.cfg.curriculum_maximum_terrain_index),
-                self.map_generator.amplitude[:, None],
+                privileged_geometry[:, None],
                 self.map_generator.friction[:, None],
                 self.terrain_risk[:, None],
                 self.unknown_ratio[:, None],
@@ -493,10 +623,11 @@ class TerrainNavigationEnv(DirectRLEnv):
             raise RuntimeError(
                 f"观测维度错误：policy={policy.shape[-1]}, critic={critic.shape[-1]}"
             )
-        if not torch.isfinite(policy).all() or not torch.isfinite(critic).all():
-            raise RuntimeError("环境观测包含NaN或Inf")
+        require_finite(policy, "policy环境观测")
+        require_finite(critic, "critic环境观测")
         return {"policy": policy, "critic": critic}
 
+    """ 一个回合结束做什么 """
     def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None) -> None:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
@@ -511,14 +642,94 @@ class TerrainNavigationEnv(DirectRLEnv):
                 "Episode/collision_rate": self.collision[completed_ids].float().mean(),
                 "Episode/unstable_rate": self.unstable[completed_ids].float().mean(),
                 "Episode/stuck_rate": self.stuck[completed_ids].float().mean(),
+                "Episode/timeout_rate": self.time_out[completed_ids].float().mean(),
+                "Episode/out_of_bounds_rate": (
+                    self.out_of_bounds[completed_ids].float().mean()
+                ),
+                "Episode/observation_failure_rate": (
+                    self.observation_failure[completed_ids].float().mean()
+                ),
                 "Curriculum/mean_level": self.curriculum.levels.float().mean(),
+                "Curriculum/mean_goal_level": (
+                    self.curriculum.goal_levels.float().mean()
+                ),
+                "Curriculum/frontier_success_ema": (
+                    self.curriculum.success_rate.mean()
+                ),
+                "Curriculum/full_difficulty_success_ema": (
+                    self.curriculum.full_difficulty_success_rate.mean()
+                ),
+                "Curriculum/mean_full_difficulty_episode_count": (
+                    self.curriculum.full_difficulty_episode_count.float().mean()
+                ),
+                "Curriculum/mean_frontier_difficulty": (
+                    self.curriculum.frontier_difficulty().mean()
+                ),
+                "Curriculum/mean_goal_maximum_m": (
+                    self.current_goal_sampling_maximum_m.mean()
+                ),
+                "Episode/completed_count": completed.float().sum(),
+                "Episode/final_navigation_potential": (
+                    self.current_navigation_potential[completed_ids].mean()
+                ),
+                "Sensor/observed_ratio": (
+                    self.current_map[completed_ids, 2].mean()
+                ),
+                "Sensor/height_valid_ratio": (
+                    self.current_map[completed_ids, 3].mean()
+                ),
             }
+            if self.map_generator.lidar_sensor is not None:
+                episode_log["Sensor/mean_point_count"] = (
+                    self.map_generator.lidar_sensor.last_hit_mask[completed_ids]
+                    .sum(dim=1)
+                    .float()
+                    .mean()
+                )
+            episode_log.update(
+                {
+                    f"Reward/{name}": values[completed_ids].mean()
+                    for name, values in self.reward_term_sums.items()
+                }
+            )
+            completed_terrain = self.map_generator.terrain_type[completed_ids]
+            terrain_episode_counts = torch.bincount(
+                completed_terrain, minlength=len(TERRAIN_NAMES)
+            )
+            terrain_success_counts = torch.bincount(
+                completed_terrain[self.reached[completed_ids]],
+                minlength=len(TERRAIN_NAMES),
+            )
+            self.terrain_episode_totals += terrain_episode_counts
+            self.terrain_success_totals += terrain_success_counts
+            for terrain_index, terrain_name in enumerate(TERRAIN_NAMES):
+                terrain_mask = completed_terrain == terrain_index
+                episode_log[f"Terrain/{terrain_name}_episode_count"] = (
+                    terrain_mask.float().sum()
+                )
+                episode_log[f"Terrain/{terrain_name}_success_count"] = (
+                    self.reached[completed_ids][terrain_mask].float().sum()
+                )
+                episode_log[f"Terrain/{terrain_name}_success_rate"] = (
+                    self.terrain_success_totals[terrain_index].float()
+                    / self.terrain_episode_totals[terrain_index].clamp(min=1).float()
+                )
+            pit_mask = completed_terrain == TERRAIN_NAMES.index("pit")
+            episode_log["Terrain/pit_mean_difficulty"] = (
+                (
+                    self.map_generator.terrain_difficulty[completed_ids][pit_mask]
+                ).sum()
+                / pit_mask.sum().clamp(min=1)
+            )
             mastery_mask = (
-                self.map_generator.terrain_type[completed_ids]
-                == self.curriculum.levels[completed_ids]
+                completed_terrain == self.curriculum.levels[completed_ids]
             )
             mastery_ids = completed_ids[mastery_mask]
-            self.curriculum.update(mastery_ids, self.reached[mastery_ids])
+            self.curriculum.update(
+                mastery_ids,
+                self.reached[mastery_ids],
+                self.map_generator.terrain_difficulty[mastery_ids],
+            )
         super()._reset_idx(env_ids)
         if episode_log is not None:
             self.extras["log"] = episode_log
@@ -529,7 +740,35 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.stuck_time[env_ids] = 0.0
         self.bad_observation_steps[env_ids] = 0
         self.execution_model.reset(env_ids)
-        self.map_generator.reset(env_ids, self.curriculum.levels[env_ids])
+        maximum_terrain_index = self.curriculum.levels[env_ids]
+        preferred_terrain_index = maximum_terrain_index
+        preferred_probability = self.frontier_sampling_probability
+        challenge_probability = self.challenge_sampling_probability
+        preferred_difficulty = self.curriculum.frontier_difficulty(env_ids)
+        if self.cfg.terrain_sampling_maximum_index >= 0:
+            maximum_terrain_index = torch.full_like(
+                maximum_terrain_index,
+                self.cfg.terrain_sampling_maximum_index,
+            )
+            preferred_terrain_index = None
+            preferred_probability = 0.0
+            challenge_probability = 0.0
+            preferred_difficulty = torch.ones_like(preferred_difficulty)
+        else:
+            maximum_terrain_index = torch.full_like(
+                maximum_terrain_index,
+                self.cfg.curriculum_maximum_terrain_index,
+            )
+        self.map_generator.reset(
+            env_ids=env_ids,
+            maximum_terrain_index=maximum_terrain_index,
+            minimum_terrain_index=self.cfg.terrain_sampling_minimum_index,
+            preferred_terrain_index=preferred_terrain_index,
+            preferred_probability=preferred_probability,
+            challenge_probability=challenge_probability,
+            challenge_level_span=self.challenge_level_span,
+            preferred_difficulty=preferred_difficulty,
+        )
 
         # 先确定机器人初始航向，再依据完整位姿生成目标。
         heading_error = 0.7 * (
@@ -546,10 +785,25 @@ class TerrainNavigationEnv(DirectRLEnv):
             ),
         )
 
+        if self.cfg.terrain_sampling_maximum_index >= 0:
+            goal_sampling_maximum = torch.full(
+                (count,),
+                self.cfg.local_goal_maximum_m,
+                device=self.device,
+            )
+        else:
+            goal_sampling_maximum = goal_distance_maximum_for_levels(
+                self.curriculum.goal_levels[env_ids],
+                initial_level=self.curriculum_initial_level,
+                maximum_level=self.cfg.curriculum_maximum_terrain_index,
+                start_maximum_m=self.cfg.local_goal_curriculum_start_maximum_m,
+                final_maximum_m=self.cfg.local_goal_maximum_m,
+            )
+        self.current_goal_sampling_maximum_m[env_ids] = goal_sampling_maximum
         self.goal_xy[env_ids] = self.map_generator.sample_task_goals(
             self.pose[env_ids],
-            self.cfg.local_goal_minimum_m,
-            self.cfg.local_goal_maximum_m,
+            self.cfg.local_goal_reset_minimum_m,
+            goal_sampling_maximum,
             env_ids,
         )
         generated_map, ground_reference_z = self.map_generator.generate(
@@ -576,7 +830,19 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.current_distance[env_ids] = torch.linalg.vector_norm(
             self.goal_xy[env_ids] - self.pose[env_ids, :2], dim=-1
         )
-        self.previous_distance[env_ids] = self.current_distance[env_ids]
+        self.current_navigation_potential[env_ids] = (
+            self.map_generator.navigation_potential(
+                self.pose[env_ids],
+                self.goal_xy[env_ids],
+                env_ids,
+            )
+        )
+        self.previous_navigation_potential[env_ids] = (
+            self.current_navigation_potential[env_ids]
+        )
+        self.best_navigation_potential[env_ids] = (
+            self.current_navigation_potential[env_ids]
+        )
         self.path_increment[env_ids] = 0.0
         self.action_limit_violation[env_ids] = 0.0
         self.collision[env_ids] = False
@@ -587,6 +853,9 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.stuck[env_ids] = False
         self.out_of_bounds[env_ids] = False
         self.observation_failure[env_ids] = False
+        self.time_out[env_ids] = False
+        for values in self.reward_term_sums.values():
+            values[env_ids] = 0.0
         self.sensor_fusion_buffer.reset(
             env_ids,
             self.current_map[env_ids],

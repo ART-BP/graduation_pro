@@ -1,15 +1,39 @@
 terrain:
   enabled_types: [flat, ramp, step, stairs, rough, pit, wall, pillar, mixed, multi_route]
-  ramp_slope_range: [0.05, 0.35]
+  ramp_slope_range: [0.05, 0.40]
   step_height_range_m: [0.05, 0.35]
   step_width_range_m: [0.25, 0.60]
   rough_amplitude_range_m: [0.01, 0.12]
   pit_depth_range_m: [0.05, 0.40]
-  obstacle_height_range_m: [0.55, 1.20]
+  # pit使用独立半宽；初次接触时从浅、窄坑开始，随前沿掌握度连续增难。
+  pit_half_width_range_m: [0.25, 0.60]
+  pit_curriculum_start_depth_max_m: 0.12
+  pit_curriculum_start_half_width_max_m: 0.35
+  # 确保目标位于坑的远端之外，而不是落在坑边或危险区域内。
+  pit_goal_clearance_m: 0.80
+  obstacle_height_range_m: [0.55, 2.5]
+  # 障碍带保留可绕行通道，并随机化绕行幅度。
+  barrier_half_width_range_m: [0.40, 2.0]
+  # 高于当前课程前沿的挑战样本先使用较窄障碍，再在正式前沿中恢复完整宽度。
+  challenge_barrier_width_scale: 0.55
+  # 障碍感知奖励绕行端点相对墙端的安全余量。
+  barrier_navigation_clearance_m: 0.35
   friction_range: [0.35, 1.20]
 curriculum:
-  initial_level: 0
+  # 第四版仍从台阶等级启动，并通过回放维持低等级地形能力。
+  initial_level: 2
+  minimum_level: 2
   maximum_level: 9
-  success_rate_up: 0.80
-  success_rate_down: 0.45
-  minimum_episodes_per_level: 8
+  success_rate_up: 0.85
+  success_rate_down: 0.20
+  # 先用100个前沿回合完成等级内难度爬升，再单独验证完整难度。
+  minimum_episodes_per_level: 100
+  full_difficulty_threshold: 0.90
+  minimum_full_difficulty_episodes: 30
+  success_rate_smoothing: 0.10
+  # 地形按最高已解锁前沿单调推进。低成功率通过回放恢复，不再自动降级。
+  allow_level_demotion: false
+  # 50%当前前沿、45%低等级回放、5%未来一级挑战，抑制灾难性遗忘。
+  frontier_sampling_probability: 0.50
+  challenge_sampling_probability: 0.05
+  challenge_level_span: 1

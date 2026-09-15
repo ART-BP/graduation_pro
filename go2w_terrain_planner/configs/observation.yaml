@@ -4,18 +4,23 @@ map:
   source_size: 200
   output_size: 100
   history_length: 5
-  observation_fusion_length: 5
+  # 每张网络地图快照融合最近12次对齐观测，可保留十帧以前的信息。
+  observation_fusion_length: 12
   channels: 4
   ground_fill_value: 0.0
   range_fill_value: 0.0
-  max_abs_relative_height_m: 1.5
+  max_abs_relative_height_m: 3.0
   max_height_range_m: 3.0
   normalize_heights: true
-  minimum_observed_ratio: 0.01
-  minimum_height_valid_ratio: 0.005
+  minimum_observed_ratio: 0.05
+  minimum_height_valid_ratio: 0.01
 goal:
-  minimum_distance_m: 1.5
-  maximum_distance_m: 4.0
+  # Actor局部目标接口覆盖0～10 m；episode重置时排除已进入终点容差的目标。
+  minimum_distance_m: 0.0
+  maximum_distance_m: 10.0
+  reset_minimum_distance_m: 1.5
+  # 目标采样上限随地形课程由4 m逐步扩展到10 m。
+  curriculum_start_maximum_m: 4.0
 history:
   command_length: 4
   motion_length: 4

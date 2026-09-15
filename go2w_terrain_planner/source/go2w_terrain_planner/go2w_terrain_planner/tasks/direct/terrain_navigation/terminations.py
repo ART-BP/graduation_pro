@@ -3,6 +3,24 @@
 from __future__ import annotations
 
 
+def effective_terrain_entry_alignment(raw_alignment, terrain_type):
+    """Ignore feature-axis alignment for terrain normally handled by detouring."""
+    import torch
+
+    if raw_alignment.shape != terrain_type.shape:
+        raise ValueError("进入角与地形类型张量尺寸不一致")
+    alignment_sensitive = (
+        (terrain_type == 2)
+        | (terrain_type == 3)
+        | (terrain_type == 8)
+    )
+    return torch.where(
+        alignment_sensitive,
+        raw_alignment,
+        torch.ones_like(raw_alignment),
+    )
+
+
 def terrain_failure_state(
     collision_height_m,
     hazard_height_m,

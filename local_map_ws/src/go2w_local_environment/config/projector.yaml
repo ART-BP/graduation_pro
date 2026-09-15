@@ -8,8 +8,8 @@ map:
 input_crop:
   # Each registered LiDAR frame is first truncated to a robot-centered
   # 15 m x 15 m horizontal box. The rolling map uses the inner 10 m x 10 m.
-  length_x: 15.0
-  length_y: 15.0
+  length_x: 12.0
+  length_y: 12.0
 
 sensor:
   # XT16 origin expressed in the FAST-LIO body/IMU frame. Keep this equal to
@@ -58,13 +58,38 @@ projection:
   # estimated supporting ground below the robot is zero.
   ground_percentile: 0.10
 
-  # Cells with fewer retained points stay unknown: observed_mask=0 and the
-  # two height channels remain NaN. Start with 1 for the sparse XT16 scan.
+  # The second physical layer is a robust vertical span, not clearance. The
+  # configured tails are discarded when a cell has enough samples; sparse
+  # cells are made reliable by temporal confirmation below.
+  span_lower_percentile: 0.05
+  span_upper_percentile: 0.95
+
+  # A one-point frame is recorded as measured but its two height channels
+  # remain NaN until a consistent return confirms it in a later frame.
   minimum_points_per_cell: 1
 
 fusion:
   # Each directly measured cell retains at most five frame measurements.
   history_length: 5
+
+  # A frame containing at least two points is immediately usable. Otherwise
+  # two consistent one-point frames are required. Ground candidates farther
+  # apart than the configured tolerance do not confirm each other.
+  minimum_confirming_frames: 2
+  reliable_frame_minimum_points: 2
+  maximum_ground_deviation: 0.12
+
+  # Use the upper quartile of consistent per-frame spans. This keeps repeated
+  # discontinuities but rejects a single extreme frame in a full history.
+  span_percentile: 0.75
+
+  # Two repeated flat observations at the same ground height clear old
+  # high-span measurements. High-span cells also become unknown sooner when
+  # they are not re-observed; they are never cleared by 2-D ray evidence alone.
+  dynamic_span_threshold: 0.15
+  flat_span_threshold: 0.05
+  flat_clear_confirmation_frames: 2
+  dynamic_elevation_stale_after: 2.0
 
   # Ground measurements are static terrain memory and live much longer than
   # ray traversal state. Cells are still cleared when they roll out of map.

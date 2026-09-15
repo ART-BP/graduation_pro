@@ -28,6 +28,24 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--terrain-min-level",
+    type=int,
+    default=None,
+    help="Optional minimum terrain index for a short stress-training run.",
+)
+parser.add_argument(
+    "--terrain-max-level",
+    type=int,
+    default=None,
+    help="Optional maximum terrain index; setting either terrain bound bypasses curriculum sampling.",
+)
+parser.add_argument(
+    "--finetune",
+    action="store_true",
+    default=False,
+    help="Load model weights from --checkpoint but start a new optimizer and iteration count.",
+)
+parser.add_argument(
     "--project-config-dir",
     "--project_config_dir",
     dest="project_config_dir",
@@ -88,6 +106,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 import gymnasium as gym
 import torch
@@ -115,10 +134,19 @@ logger = logging.getLogger(__name__)
 
 import go2w_terrain_planner.tasks  # noqa: F401
 from go2w_terrain_planner.models import Go2wActorCritic
-from go2w_terrain_planner.utils.config_loader import apply_project_config, load_project_config
-from go2w_terrain_planner.utils.config_loader import default_config_directory
-from go2w_terrain_planner.utils.logging_utils import mirror_latest_checkpoint, prepare_run_directory
-from pathlib import Path
+from go2w_terrain_planner.utils.config_loader import (
+    apply_project_config,
+    apply_terrain_sampling_range,
+    default_config_directory,
+    load_project_config,
+)
+from go2w_terrain_planner.utils.logging_utils import (
+    mirror_latest_checkpoint,
+    prepare_run_directory,
+    validate_checkpoint,
+    validate_module_parameters,
+    validate_ppo_loss_dict,
+)
 
 # RSL-RL 3.1.2 resolves policy class names in on_policy_runner.py globals.
 # Isaac Lab 2.3.2 pins that release, so register the external model explicitly.
@@ -135,8 +163,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Train with RSL-RL agent."""
     project_config = load_project_config(args_cli.project_config_dir)
     apply_project_config(env_cfg, agent_cfg, project_config, args_cli.project_config_dir)
+    apply_terrain_sampling_range(
+        env_cfg,
+        args_cli.terrain_min_level,
+        args_cli.terrain_max_level,
+    )
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    if agent_cfg.resume and args_cli.finetune:
+        raise ValueError("--resume与--finetune不能同时使用")
+    if args_cli.finetune and args_cli.checkpoint is None:
+        raise ValueError("--finetune必须显式提供--checkpoint")
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
@@ -173,6 +210,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join(runs_root, "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
+
+    load_requested = bool(
+        agent_cfg.resume
+        or args_cli.finetune
+        or agent_cfg.algorithm.class_name == "Distillation"
+    )
+    if load_requested:
+        checkpoint_value = str(agent_cfg.load_checkpoint)
+        checkpoint_path = Path(checkpoint_value).expanduser()
+        if checkpoint_path.is_absolute():
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"Checkpoint文件不存在: {checkpoint_path}")
+            resume_path = str(checkpoint_path)
+        else:
+            resume_path = get_checkpoint_path(
+                log_root_path,
+                agent_cfg.load_run,
+                agent_cfg.load_checkpoint,
+            )
+        load_optimizer = bool(
+            agent_cfg.resume
+            and not args_cli.finetune
+            and agent_cfg.algorithm.class_name != "Distillation"
+        )
+        validate_checkpoint(
+            resume_path,
+            include_optimizer=load_optimizer,
+            required_action_std_parameterization_version=(
+                2 if load_optimizer else None
+            ),
+            required_policy_architecture_version=2,
+        )
+
     # specify directory for logging runs: {time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not
@@ -206,24 +276,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        checkpoint_value = str(agent_cfg.load_checkpoint)
-        checkpoint_path = Path(checkpoint_value).expanduser()
-
-        if checkpoint_path.is_absolute():
-            if not checkpoint_path.is_file():
-                raise FileNotFoundError(
-                    f"Checkpoint文件不存在: {checkpoint_path}"
-                )
-            resume_path = str(checkpoint_path)
-        else:
-            resume_path = get_checkpoint_path(
-                log_root_path,
-                agent_cfg.load_run,
-                agent_cfg.load_checkpoint,
-            )
-
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
@@ -236,6 +288,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    task_environment = env.unwrapped
     start_time = time.time()
 
     # wrap around environment for rsl-rl
@@ -251,26 +304,167 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if load_requested:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path, load_optimizer=False)
+        checkpoint_infos = runner.load(resume_path, load_optimizer=load_optimizer)
+        if args_cli.finetune:
+            runner.current_learning_iteration = 0
+        elif agent_cfg.resume and hasattr(task_environment, "curriculum"):
+            curriculum_state = (
+                checkpoint_infos.get("terrain_curriculum")
+                if isinstance(checkpoint_infos, dict)
+                else None
+            )
+            if curriculum_state is None:
+                logger.warning(
+                    "Checkpoint不包含课程状态；将从当前配置的初始等级继续。"
+                )
+            else:
+                task_environment.curriculum.load_state_dict(curriculum_state)
+                # 环境在runner构造时已经按初始课程生成过任务；恢复课程后立即
+                # 全量重置，避免续训的第一批rollout仍停留在初始难度。
+                env.reset()
+                print(
+                    "[INFO] Restored terrain curriculum: "
+                    f"mean_level={task_environment.curriculum.levels.float().mean().item():.2f}",
+                    flush=True,
+                )
+        validate_module_parameters(runner.alg.policy, label="载入后的policy")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    # Random episode phases are useful only for training from scratch.
-    # Re-randomizing episode lengths after loading a checkpoint abruptly
-    # changes timeout/return distributions and can destabilize PPO updates.
-    init_at_random_ep_len = not bool(args_cli.resume)
+    # Checkpoint不包含并行环境的完整物理状态。随机化初始episode相位可避免
+    # 续训后所有环境同步超时，因而从头训练、续训和微调均保持启用。
+    init_at_random_ep_len = True
 
     print(
         f"[INFO] init_at_random_ep_len={init_at_random_ep_len}",
         flush=True,
     )
 
+    original_save = runner.save
+
+    def checked_save(path, infos=None):
+        validate_module_parameters(runner.alg.policy, label="待保存policy")
+        checkpoint_infos = {} if infos is None else dict(infos)
+        if hasattr(task_environment, "curriculum"):
+            checkpoint_infos["terrain_curriculum"] = (
+                task_environment.curriculum.state_dict()
+            )
+        return original_save(path, infos=checkpoint_infos)
+
+    runner.save = checked_save
+    original_update = runner.alg.update
+
+    def checked_update(*args, **kwargs):
+        losses = original_update(*args, **kwargs)
+        validate_ppo_loss_dict(losses)
+        losses["diagnostic_learning_rate"] = float(runner.alg.learning_rate)
+        losses["diagnostic_action_mean_abs"] = float(
+            runner.alg.policy.action_mean.detach().abs().mean().item()
+        )
+        losses["diagnostic_action_std"] = float(
+            runner.alg.policy.action_std.detach().mean().item()
+        )
+        return losses
+
+    runner.alg.update = checked_update
+
+    # 保存基于训练回合成功率EMA的候选最佳模型。它不能替代独立的确定性
+    # evaluate，但能防止后期策略退化时只留下最新的坏checkpoint。
+    original_log = runner.log
+    success_ema = None
+    best_curriculum_progress = float("-inf")
+    best_frontier_success = float("-inf")
+    completed_log_batches = 0
+    last_best_save_iteration = -50
+
+    def monitored_log(locs, *args, **kwargs):
+        nonlocal success_ema
+        nonlocal best_curriculum_progress
+        nonlocal best_frontier_success
+        nonlocal completed_log_batches
+        nonlocal last_best_save_iteration
+
+        success_values = []
+        for episode_info in locs.get("ep_infos", []):
+            if "Episode/success_rate" in episode_info:
+                value = torch.as_tensor(
+                    episode_info["Episode/success_rate"],
+                    dtype=torch.float32,
+                )
+                success_values.append(float(value.mean().item()))
+        if success_values:
+            batch_success = sum(success_values) / len(success_values)
+            success_ema = (
+                batch_success
+                if success_ema is None
+                else 0.9 * success_ema + 0.1 * batch_success
+            )
+            completed_log_batches += 1
+            locs["loss_dict"]["diagnostic_success_ema"] = success_ema
+
+        result = original_log(locs, *args, **kwargs)
+
+        iteration = int(locs["it"])
+        if success_ema is not None and completed_log_batches >= 20:
+            curriculum = task_environment.curriculum
+            frontier_difficulty = curriculum.frontier_difficulty()
+            mean_level = float(curriculum.levels.float().mean().item())
+            mean_goal_level = float(
+                curriculum.goal_levels.float().mean().item()
+            )
+            mean_frontier_difficulty = float(
+                frontier_difficulty.mean().item()
+            )
+            frontier_success = float(curriculum.success_rate.mean().item())
+            # ``level + intra-level difficulty``在升级前后近似连续：例如
+            # 5+1与6+0代表相同课程进度。优先保存更高课程进度，只有在
+            # 进度相近时才比较前沿成功率，避免低等级高成功率覆盖高等级模型。
+            curriculum_progress = mean_level + mean_frontier_difficulty
+            enough_interval = iteration - last_best_save_iteration >= 50
+            progress_improved = (
+                curriculum_progress > best_curriculum_progress + 0.01
+            )
+            same_progress_better = (
+                curriculum_progress >= best_curriculum_progress - 0.01
+                and frontier_success > best_frontier_success + 0.02
+            )
+            if (
+                (progress_improved or same_progress_better)
+                and enough_interval
+            ):
+                best_curriculum_progress = curriculum_progress
+                best_frontier_success = frontier_success
+                last_best_save_iteration = iteration
+                runner.save(
+                    os.path.join(log_dir, "model_best.pt"),
+                    infos={
+                        "best_training_success_ema": success_ema,
+                        "best_training_mean_level": mean_level,
+                        "best_training_mean_goal_level": mean_goal_level,
+                        "best_training_frontier_success_ema": frontier_success,
+                        "best_training_frontier_difficulty": (
+                            mean_frontier_difficulty
+                        ),
+                        "best_training_curriculum_progress": curriculum_progress,
+                        "best_training_iteration": iteration,
+                    },
+                )
+                print(
+                    "[INFO] Updated model_best.pt: "
+                    f"iteration={iteration}, "
+                    f"curriculum_progress={curriculum_progress:.3f}, "
+                    f"frontier_success={frontier_success:.3f}, "
+                    f"success_ema={success_ema:.3f}",
+                    flush=True,
+                )
+        return result
+
+    runner.log = monitored_log
     runner.learn(
         num_learning_iterations=agent_cfg.max_iterations,
         init_at_random_ep_len=init_at_random_ep_len,

@@ -14,6 +14,7 @@ os.environ.setdefault("GO2W_SKIP_TASK_IMPORT", "1")
 
 from go2w_terrain_planner.models import ActorExportWrapper, Go2wActorCritic
 from go2w_terrain_planner.utils.config_loader import load_project_config
+from go2w_terrain_planner.utils.logging_utils import validate_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +57,7 @@ def main() -> None:
         fusion_hidden_dim=int(config["model"]["fusion_hidden_dim"]),
         critic_hidden_dims=list(config["model"]["critic_hidden_dims"]),
     )
+    validate_checkpoint(args.checkpoint, include_optimizer=False)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state = checkpoint.get("model_state_dict", checkpoint.get("model"))
     if state is None:

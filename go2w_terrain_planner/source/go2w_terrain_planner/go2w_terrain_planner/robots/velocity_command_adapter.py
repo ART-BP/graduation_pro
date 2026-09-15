@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from go2w_terrain_planner.utils.tensor_checks import require_finite
+
 
 @dataclass
 class ActionLimits:
@@ -34,13 +36,13 @@ class VelocityCommandAdapter:
         if self.limits.angular_min_radps >= self.limits.angular_max_radps:
             raise ValueError("角速度上下限无效")
 
+    """输出归一化动作转化为实际动作"""
     def to_physical(self, normalized_action):
         import torch
 
         if normalized_action.shape[-1] != 2:
             raise ValueError("动作最后一维必须为2")
-        if not torch.isfinite(normalized_action).all():
-            raise RuntimeError("归一化动作包含NaN或Inf")
+        require_finite(normalized_action, "归一化动作")
         action = torch.clamp(normalized_action, -1.0, 1.0)
         linear = self.limits.linear_min_mps + 0.5 * (action[..., 0] + 1.0) * (
             self.limits.linear_max_mps - self.limits.linear_min_mps
@@ -118,6 +120,5 @@ class VelocityExecutionModel:
             self.actual_velocity[:, 0] = torch.where(
                 blocked, 0.05 * self.actual_velocity[:, 0], self.actual_velocity[:, 0]
             )
-        if not torch.isfinite(self.actual_velocity).all():
-            raise RuntimeError("速度执行模型产生NaN或Inf")
+        require_finite(self.actual_velocity, "速度执行模型输出")
         return self.actual_velocity

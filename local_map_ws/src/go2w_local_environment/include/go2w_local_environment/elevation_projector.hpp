@@ -7,9 +7,11 @@
 namespace go2w_local_environment {
 
 struct ElevationProjectionParameters {
-  double vertical_min_offset{-1.0};
-  double vertical_max_offset{1.5};
-  double ground_percentile{0.20};
+  double vertical_min_offset{-1.5};
+  double vertical_max_offset{2.8};
+  double ground_percentile{0.10};
+  double span_lower_percentile{0.05};
+  double span_upper_percentile{0.95};
   std::size_t minimum_points_per_cell{1};
 };
 
@@ -20,6 +22,25 @@ struct ElevationCell {
   float maximum_height;
   std::size_t point_count{0};
   bool observed{false};
+};
+
+struct ElevationFusionParameters {
+  // A single sparse return is provisional. It becomes a usable height after
+  // repeated, geometrically consistent observations.
+  std::size_t minimum_confirming_frames{2};
+  std::size_t reliable_frame_minimum_points{2};
+  float maximum_ground_deviation{0.12F};
+
+  // Fuse per-frame vertical spans with an upper quantile. This preserves
+  // repeated discontinuities while rejecting an isolated extreme frame.
+  double span_percentile{0.75};
+
+  // Repeated flat observations at the same supporting height remove old
+  // high-span measurements, which clears moved objects without treating a
+  // 2-D ray traversal as proof of free ground.
+  float dynamic_span_threshold{0.15F};
+  float flat_span_threshold{0.05F};
+  std::size_t flat_clear_confirmation_frames{2};
 };
 
 struct ElevationHoleFillParameters {
@@ -70,8 +91,8 @@ class ElevationProjector {
   explicit ElevationProjector(
       const ElevationProjectionParameters& parameters);
 
-  // Removes non-finite samples and partially reorders the input buffer while
-  // selecting the configured low percentile without a full sort.
+  // Removes non-finite samples, sorts the input buffer, and extracts a low
+  // ground percentile together with a robust vertical span.
   ElevationCell project(std::vector<float>& heights) const;
 
   const ElevationProjectionParameters& parameters() const;
@@ -112,11 +133,13 @@ class IncrementalElevationCell {
   void add(
       const ElevationCell& measurement,
       double stamp,
-      std::size_t maximum_history_length);
+      std::size_t maximum_history_length,
+      const ElevationFusionParameters& parameters);
 
   bool removeOlderThan(double oldest_allowed_stamp);
 
-  ElevationCell fused() const;
+  ElevationCell fused(
+      const ElevationFusionParameters& parameters) const;
 
   void clear();
 
@@ -130,10 +153,12 @@ class IncrementalElevationCell {
     float ground_height;
     float minimum_height;
     float maximum_height;
+    float height_range;
     std::size_t point_count;
   };
 
   std::deque<Measurement> measurements_;
+  std::size_t consecutive_flat_observations_{0U};
 };
 
 }  // namespace go2w_local_environment

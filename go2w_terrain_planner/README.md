@@ -28,15 +28,34 @@ Dockerfile 不使用 `latest`。如果基础镜像需要 NGC 权限，请先按�
 - 用运动学刚体作为 Go2W 外形占位对象；
 - 用独立的高层速度执行模型模拟速度滞后、加速度限制、摩擦、有限地形阻力、进入角度、跟踪噪声和卡住；
 - 用单级突变、障碍高度、坑深和足迹支撑变化分别构造单调的碰撞与失稳结果；
-- 用解析式地形快速生成与实机接口等价的四通道局部地图；
+- 用可配置的 XT16 式 16 线首回波射线生成稀疏点云，再投影为与实机接口等价的四通道局部地图；
+- 保留解析式稠密观测作为快速消融基线，可由配置切换；
 - 仿真先生成 `200 × 200` 原始地图，再使用共享预处理逻辑保守下采样到 `100 × 100`；
 - 用 CNN + GRU Actor 和特权 Critic 训练 PPO；
 - 支持无显示器训练、回放、评估和 ONNX 导出。
 
+第二版训练配置在不改变 Actor 四通道观测和网络接口的前提下，增加了以下机制：
+
+- 课程从`step(2)`启动，采用50%当前前沿、45%低等级回放和5%未来一级挑战；每级先用至少100个前沿回合完成难度爬升，再要求至少30个难度不低于0.9的完整难度回合且专项EMA成功率达到0.85，才允许单调解锁下一级；
+- 地形难度与目标距离采用两个进度状态：当前前沿负责选择正在挑战的地形，已掌握等级负责目标距离上限，因此进入新地形时不会同时增加目标距离，且目标上限不会回退；
+- 每张网络地图快照融合最近 12 次经过 SE(2) 和高度参考对齐的观测，使十次更新以前的有效栅格仍可保留；Actor 仍只接收最近 5 张滚动地图快照；
+- 地图 CNN 通道扩大为 `24/48/96/128`，末端空间结构从 `4×4` 提高到 `6×6`，CNN 与 GRU 特征提高到 192 维，融合层和 Critic 提高到 256 维；
+- 局部目标距离接口覆盖 `0～10 m`，episode初始目标仍至少为`1.5 m`；采样上限依据已掌握等级从`4 m`线性扩展到`10 m`，比当前地形前沿落后一级，避免同时增加地形与距离难度；
+- `pit(5)`采用浅窄坑到完整坑洼的等级内连续课程，`wall(6)`也从较窄绕行宽度逐步扩展；容易几何回合不计入完整难度掌握统计，目标保证位于坑远端安全余量之外，侧向绕坑不再受到错误的进入角失稳惩罚；
+- 等级6墙体回合的进展奖励使用有限墙端点构造的最短绕行势能，而最终成功仍由真实欧氏距离判定；Critic在不增加维度的情况下接收该剩余路径势能和归一化墙宽，避免直线距离奖励诱导策略撞墙；
+- 进展奖励只在刷新本回合历史最近目标距离时结算，无法通过前后振荡重复领取；距离增大仍采用轻惩罚，以允许绕障所需的横移和短时退让；
+- Tanh 高斯策略将预变换均值限制为 `±1.5`，标准差通过 sigmoid 平滑约束在 `0.08～0.60`；重参数采样使 squashed entropy 的雅可比项能够正确反传，避免探索噪声在硬截断上限处锁死；
+- 训练入口检测非有限损失和异常增大的 surrogate loss，触发时立即中止，避免继续保存受污染的 checkpoint；
+- PPO 使用固定 `5e-5` 学习率，避免固定版本 RSL-RL 的自适应调度在低 KL 时将学习率放大到不适合本任务的量级；
+- PPO每轮使用48步环境数据、3次学习epoch和更低的Critic损失权重，以降低扩大模型后的梯度方差；固定学习率模式下不依赖实际不会生效的`desired_kl`；
+- `model_best.pt`优先比较“地形等级+等级内难度”的连续课程进度，同进度下再比较前沿成功率EMA，避免低等级高成功率模型覆盖已进入高难地形的模型；
+- 墙体、混合障碍和多路径障碍随机化有限横向宽度，确保地图内存在可学习的绕行通道；
+- 评估结果除总体成功率外，输出每类地形的完成回合数与成功率。
+
 当前版本没有声称完成以下两项：
 
 - Go2W 完整关节、轮腿接触和原厂底层控制器的物理模型；
-- XT16 十六线 Ray Caster 到点云、再到 Grid Map 的完整仿真链路。
+- 基于 RTX 材质、强度和厂商精确标定参数的高保真 XT16 仿真；当前版本采用适配动态解析地形的 GPU 批量首回波射线模型，垂直角可由实测标定表替换。
 
 这两项属于阶段 2。替换时保持四通道地图和 `[v_cmd,w_cmd]` 接口不变即可。资产边界定义在 `robots/go2w_cfg.py`，地图替换边界是 `SimulatedLocalMap.generate()`。
 
@@ -68,6 +87,11 @@ height_valid_mask = isfinite(ground_height) AND isfinite(height_range)
 
 这里的 `ground_height` 已由真实地图节点或仿真地图生成器转换为相对于机器人脚下参考地面的高度，平地约为 0；共享预处理器不会再减 FAST-LIO 的 IMU 高度。
 
+仿真端默认使用 `sensor.observation_source: raycast`。射线传感器输出保存在
+`SimulatedLocalMap.lidar_sensor.last_pointcloud`，形状为 `[B,N,3]`，坐标系为当前机器人局部坐标系，
+无回波射线填充为 `NaN`；`last_ranges` 和 `last_hit_mask` 分别提供量程与有效回波掩码。地形执行、碰撞和
+失稳判定仍使用独立的解析真值，Actor 只能看到由射线穿越与命中点投影得到的地图，避免特权信息泄漏。
+
 时序缓存保存每帧相对地图所使用的绝对 `ground_reference_z`。历史地图完成 SE(2) 对齐后，先用
 `source_reference_z - current_reference_z` 统一垂直零点，再送入网络。该标量不是 Actor 地图通道，由
 `local_map_ws` 与 Grid Map 同时间戳发布。
@@ -87,6 +111,8 @@ motion_history[B, 4, 3]    # 相邻里程计的 dx, dy, dyaw
 ```
 
 默认展平维度为 `200025`。Critic 额外使用仿真真值，但这些特权信息不会进入 Actor 或 ONNX 模型。
+其中目标距离以 `10 m` 归一化并截断到 `[0,1]`。机器人接近目标时能够自然观测到
+`0～1.5 m` 区间；`reset_minimum_distance_m=1.5` 只约束episode初始采样，不限制运行时接口。
 
 PPO 使用带雅可比修正的 Tanh-squashed Gaussian，采样动作和概率计算都严格位于 `[-1,1]`。环境依据
 `configs/action.yaml` 映射到物理速度。导出的 ONNX 已包含这一步映射，直接输出物理单位的
@@ -127,7 +153,8 @@ go2w_terrain_planner/
 
 ```text
 解析式地形真值 → 执行、碰撞和失稳结果
-解析式地形真值 → 独立观测扰动 → 四通道局部地图
+解析式地形真值 → XT16式首回波射线 → 稀疏点云
+  → 射线穿越/命中栅格投影 → 四通道局部地图
   → 五帧 SE(2) 与垂直参考对齐缓存
   → 共享 CNN
   → GRU
@@ -146,7 +173,7 @@ go2w_terrain_planner/
 - `action.yaml`：物理速度范围、加速度、跟踪滞后和卡住模型；
 - `reward.yaml`：全部奖励权重和终止阈值；
 - `terrain.yaml`：地形类型、几何随机范围、摩擦和课程参数；
-- `sensor.yaml`：高程噪声、漏测、仅射线观测、位姿和时间同步扰动；
+- `sensor.yaml`：`raycast/analytic`观测源、16线扫描角、量程、角分辨率、扫描频率，以及回波漏测、位姿和时间同步扰动；
 - `training.yaml`：环境数、随机种子、PPO/runner 参数、训练迭代和网络尺寸。
 
 自定义配置目录必须同时包含这六个同名文件：
@@ -231,8 +258,10 @@ docker run --rm \
   -e PRIVACY_CONSENT=Y \
   -v /data/go2w_training:/workspace/data \
   go2w-terrain-planner:0.1.0 \
-  train --num_envs 32 --seed 42 --max_iterations 1500
+  train --num_envs 32 --seed 42 --max_iterations 10000
 ```
+
+第四版长融合大模型基线必须从头建立新run。地图编码器、GRU、融合层和Critic的参数形状已经改变，第三版及更早checkpoint不能通过`--resume`或`--finetune`加载；训练入口会在启动时明确拒绝不兼容网络。第五版只修改课程、代理地形、奖励与PPO采样配置，没有改变网络形状。第六版接入稀疏激光雷达观测后网络形状仍兼容，但输入分布已显著变化，建议从头训练；如需迁移第五版权重，应使用`--finetune`建立新run，不建议恢复旧优化器和课程状态。
 
 默认先使用 `--num_envs 32`。确认显存和训练吞吐稳定后再增加到 `64` 或 `128`；五帧 `100 × 100`
 地图会被 PPO rollout 缓存，环境数对显存近似线性增长。
@@ -246,6 +275,18 @@ docker run --rm --gpus all --network host --ipc host \
   go2w-terrain-planner:0.1.0 \
   train --resume --checkpoint /workspace/data/runs/rsl_rl/go2w_terrain_navigation/RUN/model_500.pt
 ```
+
+`--resume`只应用于观测源和网络结构均相同的checkpoint；严格续训会同时恢复模型、优化器、迭代计数以及每个并行环境的课程等级/成功率状态。`--finetune`只复用兼容且有限值正常的模型权重，并以新优化器和新课程开始独立微调，适合从第五版解析观测迁移到第六版射线观测：
+
+```bash
+docker run --rm --gpus all --network host --ipc host \
+  -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y \
+  -v /data/go2w_training:/workspace/data \
+  go2w-terrain-planner:0.1.0 \
+  train --finetune --checkpoint /workspace/data/runs/rsl_rl/go2w_terrain_navigation/RUN/model_500.pt
+```
+
+训练入口会在载入和保存时检查模型张量；严格续训还会检查优化器状态与动作标准差参数化版本。包含 NaN/Inf 的 checkpoint 会被拒绝。训练过程中还会维护 `model_best.pt`，但部署前仍应通过独立的确定性评估比较该模型与周期 checkpoint。
 
 回放并录制无显示器视频：
 
@@ -269,6 +310,24 @@ docker run --rm --gpus all --network host --ipc host \
   evaluate --num_envs 16 --steps 2000 \
   --checkpoint /workspace/data/runs/rsl_rl/go2w_terrain_navigation/RUN/model_1500.pt
 ```
+
+评估和回放默认使用 `--terrain-min-level 2 --terrain-max-level 9`，因此跳过
+`flat(0)` 和 `ramp(1)`，直接从台阶及更高难度地形中均匀采样。可使用
+`--terrain-min-level 6` 只测试墙体、立柱、混合地形和多路径地形。评估结果会记录每类地形的实际步数、完成 episode 数量和成功率。
+
+短时间训练压力测试也可以绕过课程采样：
+
+```bash
+docker run --rm --gpus all --network host --ipc host \
+  -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y \
+  -v /data/go2w_training:/workspace/data \
+  go2w-terrain-planner:0.1.0 \
+  train --num_envs 32 --max_iterations 10 \
+  --terrain-min-level 2 --terrain-max-level 9
+```
+
+不提供这两个参数时，正式训练使用`configs/terrain.yaml`中的前沿—回放—挑战三级课程。挑战样本从当前等级的下一级采样，并以最易几何提前适应；当前前沿的几何难度随学习状态连续增长，已掌握回放使用完整几何范围。地形索引依次为：
+`flat=0, ramp=1, step=2, stairs=3, rough=4, pit=5, wall=6, pillar=7, mixed=8, multi_route=9`。
 
 也可以使用 Compose：
 
@@ -311,7 +370,7 @@ docker run --rm \
 
 ```text
 /data/go2w_training/
-├── runs/rsl_rl/go2w_terrain_navigation/<timestamp>_phase1_proxy/
+├── runs/rsl_rl/go2w_terrain_navigation/<timestamp>_phase6_xt16_raycast_observation/
 │   ├── configs/          # 六份配置快照
 │   ├── params/           # Isaac Lab/Hydra 实际配置
 │   ├── model_*.pt        # RSL-RL checkpoint
@@ -351,7 +410,7 @@ gzip -dc go2w-terrain-planner-0.1.0.tar.gz | docker load
 
 1. 获取合法的 Go2W USD/URDF 和原厂速度控制接口，在 `robots/go2w_cfg.py` 配置资产。
 2. 用完整 Go2W articulation 和底层速度跟踪器替换 `RigidObject` 与 `VelocityExecutionModel`。
-3. 保持四通道接口，增加 XT16 Ray Caster、点云投影和五次有效观测融合。
+3. 用实测 XT16 标定角与噪声统计校准当前 Ray Caster，并对射线点云投影和多次有效观测融合开展仿真—实机一致性评估。
 4. 采集实机的指令、实际里程计增量、地形图和通过结果，标定速度滞后、衰减、转向误差和卡住概率。
 5. 对比解析地图与 Ray Caster 地图的通道直方图、空洞率、空间相关性和时序漂移，再进行域随机化调整。
 6. 增加 ROS 推理节点，复用本仓库的预处理、坐标变换、时序缓存和 ONNX 物理速度输出。

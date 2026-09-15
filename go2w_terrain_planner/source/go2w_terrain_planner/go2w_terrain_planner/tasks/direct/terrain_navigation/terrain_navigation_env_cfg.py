@@ -20,14 +20,14 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=0.02, render_interval=decimation, device="cuda:0")
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=32,
-        env_spacing=12.0,
+        env_spacing=24.0,
         replicate_physics=True,
         clone_in_fabric=False,
     )
     proxy_robot: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.CuboidCfg(
-            size=(0.70, 0.40, 0.25),
+            size=(0.80, 0.50, 0.50),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=False,
                 disable_gravity=True,
@@ -46,10 +46,12 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
     motion_history_length = 4
     minimum_observed_ratio = 0.01
     minimum_height_valid_ratio = 0.005
-    local_goal_minimum_m = 1.5
-    local_goal_maximum_m = 4.0
+    local_goal_minimum_m = 0.0
+    local_goal_maximum_m = 10.0
+    local_goal_reset_minimum_m = 1.5
+    local_goal_curriculum_start_maximum_m = 4.0
     goal_tolerance_m = 0.50
-    maximum_distance_m = 8.0
+    maximum_distance_m = 15.0
     collision_height_range_m = 0.45
     unstable_risk_threshold = 0.20
     maximum_tilt_rad = 0.65
@@ -57,6 +59,9 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
     stuck_timeout_s = 2.0
     maximum_bad_observation_steps = 3
     curriculum_maximum_terrain_index = 9
+    # -1表示使用每个环境的课程等级；非负值用于评估或压力测试时固定采样范围。
+    terrain_sampling_minimum_index = 0
+    terrain_sampling_maximum_index = -1
     project_config_directory = ""
 
     def __post_init__(self) -> None:

@@ -14,7 +14,6 @@
 
   <depend>grid_map_core</depend>
   <depend>grid_map_msgs</depend>
-  <depend>grid_map_ros</depend>
   <depend>geometry_msgs</depend>
   <depend>message_filters</depend>
   <depend>nav_msgs</depend>

@@ -8,6 +8,7 @@ from go2w_terrain_planner.robots.velocity_command_adapter import (
     VelocityExecutionModel,
 )
 from go2w_terrain_planner.tasks.direct.terrain_navigation.terminations import (
+    effective_terrain_entry_alignment,
     terrain_failure_state,
 )
 
@@ -59,3 +60,12 @@ def test_terrain_failure_is_monotonic_with_hazard() -> None:
     assert collision.tolist() == [False, False]
     assert fallen.tolist() == [False, False]
     assert unstable.tolist() == [False, True]
+
+
+def test_pit_detour_does_not_receive_axis_alignment_penalty() -> None:
+    raw = torch.tensor([0.1, 0.1, 0.1, 0.1])
+    terrain = torch.tensor([2, 3, 5, 8])
+
+    effective = effective_terrain_entry_alignment(raw, terrain)
+
+    assert effective.tolist() == pytest.approx([0.1, 0.1, 1.0, 0.1])

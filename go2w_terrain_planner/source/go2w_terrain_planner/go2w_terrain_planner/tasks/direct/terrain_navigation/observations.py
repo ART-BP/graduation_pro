@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from go2w_terrain_planner.utils.tensor_checks import require_finite
+
 
 def assemble_policy_observation(
     aligned_maps,
@@ -43,6 +45,5 @@ def assemble_policy_observation(
         raise ValueError(
             f"policy观测维度错误：actual={output.shape[-1]}, expected={expected_dimension}"
         )
-    if not torch.isfinite(output).all():
-        raise RuntimeError("policy观测包含NaN或Inf")
+    require_finite(output, "policy观测")
     return output

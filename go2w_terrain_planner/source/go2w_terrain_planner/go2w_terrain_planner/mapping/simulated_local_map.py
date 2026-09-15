@@ -1,13 +1,17 @@
 """Fast tensor-only approximation of the real rolling elevation-map interface.
 
-This is the phase-one sensor model. It generates the same four actor channels
-from analytic terrain geometry and observation corruption. A 16-line ray
-caster can replace this class later without changing the actor interface.
+The terrain truth remains analytic for efficient curriculum randomization. The
+actor observation can either use the legacy dense analytic projection or an
+XT16-style first-return lidar scan projected into the same four map channels.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from go2w_terrain_planner.utils.tensor_checks import require_finite
+
+from .simulated_xt16_lidar import SimulatedXt16Lidar, Xt16LidarConfig
 
 
 TERRAIN_NAMES = (
@@ -25,27 +29,33 @@ TERRAIN_NAMES = (
 
 
 def fuse_aligned_map_history(aligned_maps):
-    """Fuse up to five aligned observations into one real-interface-equivalent map."""
+    """Robustly fuse aligned observations using the same semantics as the real map."""
     import torch
 
     if aligned_maps.ndim != 5 or aligned_maps.shape[2] != 4:
         raise ValueError("aligned_maps必须为[B,T,4,H,W]")
     valid = aligned_maps[:, :, 3] > 0.5
     count = valid.sum(dim=1)
-    safe_count = count.clamp(min=1).to(aligned_maps.dtype)
-    ground = (aligned_maps[:, :, 0] * valid).sum(dim=1) / safe_count
-    height_range = torch.where(
-        valid,
-        aligned_maps[:, :, 1],
-        torch.zeros_like(aligned_maps[:, :, 1]),
-    ).amax(dim=1)
+    ground_samples = torch.where(
+        valid, aligned_maps[:, :, 0], torch.full_like(aligned_maps[:, :, 0], torch.inf)
+    ).sort(dim=1).values
+    ground_rank = ((count - 1).clamp(min=0) // 2).unsqueeze(1)
+    ground = ground_samples.gather(1, ground_rank).squeeze(1)
+
+    range_samples = torch.where(
+        valid, aligned_maps[:, :, 1], torch.full_like(aligned_maps[:, :, 1], torch.inf)
+    ).sort(dim=1).values
+    # 上四分位数保留稳定的局部高度突变，同时抑制单帧离群峰值。
+    range_rank = torch.ceil(
+        0.75 * (count - 1).clamp(min=0).to(aligned_maps.dtype)
+    ).long().unsqueeze(1)
+    height_range = range_samples.gather(1, range_rank).squeeze(1)
     observed = aligned_maps[:, :, 2].amax(dim=1)
     height_valid = count > 0
     ground = torch.where(height_valid, ground, torch.zeros_like(ground))
     height_range = torch.where(height_valid, height_range, torch.zeros_like(height_range))
     result = torch.stack((ground, height_range, observed, height_valid.float()), dim=1)
-    if not torch.isfinite(result).all():
-        raise RuntimeError("融合后的仿真地图包含NaN或Inf")
+    require_finite(result, "融合后的仿真地图")
     return result
 
 
@@ -73,11 +83,20 @@ class SimulatedMapConfig:
     step_width_range_m: tuple[float, float] = (0.25, 0.60)
     rough_amplitude_range_m: tuple[float, float] = (0.01, 0.12)
     pit_depth_range_m: tuple[float, float] = (0.05, 0.40)
+    pit_half_width_range_m: tuple[float, float] = (0.25, 0.60)
+    pit_curriculum_start_depth_max_m: float = 0.12
+    pit_curriculum_start_half_width_max_m: float = 0.35
+    pit_goal_clearance_m: float = 0.80
     obstacle_height_range_m: tuple[float, float] = (0.55, 1.20)
+    barrier_half_width_range_m: tuple[float, float] = (0.40, 1.20)
+    challenge_barrier_width_scale: float = 0.65
+    barrier_navigation_clearance_m: float = 0.35
     friction_range: tuple[float, float] = (0.35, 1.20)
     robot_half_length_m: float = 0.35
     robot_half_width_m: float = 0.20
     truth_lookahead_m: float = 0.02
+    observation_source: str = "analytic"
+    lidar_config: Xt16LidarConfig | None = None
 
 
 @dataclass
@@ -116,6 +135,8 @@ class SimulatedLocalMap:
         self.cfg = cfg or SimulatedMapConfig()
         if num_envs <= 0 or self.cfg.size <= 1 or self.cfg.extent_m <= 0.0:
             raise ValueError("仿真地图配置无效")
+        if self.cfg.observation_source not in {"analytic", "raycast"}:
+            raise ValueError("observation_source必须为analytic或raycast")
         if self.cfg.maximum_relative_height_m <= 0.0 or self.cfg.maximum_height_range_m <= 0.0:
             raise ValueError("仿真地图高度归一化范围必须大于0")
         if not 0.0 <= self.cfg.missing_probability <= 1.0:
@@ -126,6 +147,19 @@ class SimulatedLocalMap:
             raise ValueError("缺失率与仅射线观测率之和不能超过1")
         if not 0.0 <= self.cfg.occlusion_sector_probability <= 1.0:
             raise ValueError("occlusion_sector_probability必须位于[0,1]")
+        pit_depth_minimum, pit_depth_maximum = self.cfg.pit_depth_range_m
+        pit_width_minimum, pit_width_maximum = self.cfg.pit_half_width_range_m
+        if not (
+            0.0 < pit_depth_minimum
+            <= self.cfg.pit_curriculum_start_depth_max_m
+            <= pit_depth_maximum
+            and 0.0 < pit_width_minimum
+            <= self.cfg.pit_curriculum_start_half_width_max_m
+            <= pit_width_maximum
+            and self.cfg.pit_goal_clearance_m > 0.0
+            and self.cfg.barrier_navigation_clearance_m > 0.0
+        ):
+            raise ValueError("pit渐进课程参数无效")
         if (
             self.cfg.robot_half_length_m <= 0.0
             or self.cfg.robot_half_width_m <= 0.0
@@ -134,6 +168,15 @@ class SimulatedLocalMap:
             raise ValueError("机器人真值查询尺寸无效")
         self.num_envs = num_envs
         self.device = torch.device(device)
+        self.lidar_sensor = (
+            SimulatedXt16Lidar(
+                num_envs,
+                self.device,
+                self.cfg.lidar_config or Xt16LidarConfig(),
+            )
+            if self.cfg.observation_source == "raycast"
+            else None
+        )
         unknown_names = set(self.cfg.enabled_terrain_names) - set(TERRAIN_NAMES)
         if unknown_names:
             raise ValueError(f"未知地形类型：{sorted(unknown_names)}")
@@ -176,17 +219,47 @@ class SimulatedLocalMap:
         self.feature_yaw = torch.zeros(num_envs, device=self.device)
         self.route_yaw = torch.zeros(num_envs, device=self.device)
         self.feature_width = torch.ones(num_envs, device=self.device)
+        self.barrier_half_width = torch.ones(num_envs, device=self.device)
+        self.terrain_difficulty = torch.ones(num_envs, device=self.device)
         self.friction = torch.ones(num_envs, device=self.device)
         self.occlusion_enabled = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self.occlusion_angle = torch.zeros(num_envs, device=self.device)
         self.occlusion_width = torch.zeros(num_envs, device=self.device)
         self.reset(torch.arange(num_envs, device=self.device))
 
-    def reset(self, env_ids, maximum_terrain_index: int | None = None) -> None:
+    def reset(
+        self,
+        env_ids,
+        maximum_terrain_index: int | None = None,
+        minimum_terrain_index: int | None = None,
+        preferred_terrain_index: int | None = None,
+        preferred_probability: float = 0.0,
+        challenge_probability: float = 0.0,
+        challenge_level_span: int = 1,
+        preferred_difficulty=1.0,
+    ) -> None:
         import torch
 
+        if (
+            not 0.0 <= preferred_probability <= 1.0
+            or not 0.0 <= challenge_probability <= 1.0
+            or preferred_probability + challenge_probability > 1.0
+        ):
+            raise ValueError("课程采样概率无效")
+        if challenge_level_span <= 0:
+            raise ValueError("challenge_level_span必须为正整数")
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         count = env_ids.numel()
+        preferred_difficulty = torch.as_tensor(
+            preferred_difficulty, dtype=torch.float32, device=self.device
+        )
+        if preferred_difficulty.ndim == 0:
+            preferred_difficulty = preferred_difficulty.expand(count)
+        if (
+            preferred_difficulty.shape != (count,)
+            or torch.any((preferred_difficulty < 0.0) | (preferred_difficulty > 1.0))
+        ):
+            raise ValueError("preferred_difficulty必须是[0,1]内的标量或逐环境张量")
         maximum_index = (
             torch.full((count,), len(TERRAIN_NAMES) - 1, dtype=torch.long, device=self.device)
             if maximum_terrain_index is None
@@ -197,13 +270,113 @@ class SimulatedLocalMap:
         if maximum_index.shape != (count,):
             raise ValueError("maximum_terrain_index必须是标量或与env_ids等长的张量")
         maximum_index = maximum_index.clamp(0, len(TERRAIN_NAMES) - 1)
-        eligible = self.enabled_terrain_indices[None, :] <= maximum_index[:, None]
+        minimum_index = (
+            torch.zeros(count, dtype=torch.long, device=self.device)
+            if minimum_terrain_index is None
+            else torch.as_tensor(
+                minimum_terrain_index, dtype=torch.long, device=self.device
+            )
+        )
+        if minimum_index.ndim == 0:
+            minimum_index = minimum_index.expand(count)
+        if minimum_index.shape != (count,):
+            raise ValueError("minimum_terrain_index必须是标量或与env_ids等长的张量")
+        minimum_index = minimum_index.clamp(0, len(TERRAIN_NAMES) - 1)
+        if torch.any(minimum_index > maximum_index):
+            raise ValueError("minimum_terrain_index不能大于maximum_terrain_index")
+        eligible = (
+            (self.enabled_terrain_indices[None, :] >= minimum_index[:, None])
+            & (self.enabled_terrain_indices[None, :] <= maximum_index[:, None])
+        )
         no_candidate = ~eligible.any(dim=1)
         if no_candidate.any():
-            eligible[no_candidate, 0] = True
-        selected_slots = torch.multinomial(eligible.float(), 1).squeeze(1)
+            raise ValueError("指定地形等级范围内没有启用的地形")
+        sampling_weights = eligible.float()
+        preferred_index = None
+        challenge_sample = torch.zeros(count, dtype=torch.bool, device=self.device)
+        if preferred_terrain_index is not None:
+            preferred_index = torch.as_tensor(
+                preferred_terrain_index, dtype=torch.long, device=self.device
+            )
+            if preferred_index.ndim == 0:
+                preferred_index = preferred_index.expand(count)
+            if preferred_index.shape != (count,):
+                raise ValueError("preferred_terrain_index必须是标量或与env_ids等长的张量")
+            preferred_slots = (
+                self.enabled_terrain_indices[None, :] == preferred_index[:, None]
+            ) & eligible
+            has_preferred = preferred_slots.any(dim=1)
+            replay_slots = eligible & (
+                self.enabled_terrain_indices[None, :] < preferred_index[:, None]
+            )
+            challenge_slots = (
+                eligible
+                & (
+                    self.enabled_terrain_indices[None, :]
+                    > preferred_index[:, None]
+                )
+                & (
+                    self.enabled_terrain_indices[None, :]
+                    <= preferred_index[:, None] + challenge_level_span
+                )
+            )
+            replay_count = replay_slots.sum(dim=1)
+            challenge_count = challenge_slots.sum(dim=1)
+            replay_mass = torch.full(
+                (count,),
+                1.0 - preferred_probability - challenge_probability,
+                device=self.device,
+            )
+            challenge_mass = torch.full(
+                (count,), challenge_probability, device=self.device
+            )
+            frontier_mass = torch.full(
+                (count,), preferred_probability, device=self.device
+            )
+            frontier_mass += torch.where(
+                replay_count == 0, replay_mass, torch.zeros_like(replay_mass)
+            )
+            frontier_mass += torch.where(
+                challenge_count == 0,
+                challenge_mass,
+                torch.zeros_like(challenge_mass),
+            )
+            replay_per_slot = torch.where(
+                replay_count > 0,
+                replay_mass / replay_count.clamp(min=1),
+                torch.zeros_like(replay_mass),
+            )
+            challenge_per_slot = torch.where(
+                challenge_count > 0,
+                challenge_mass / challenge_count.clamp(min=1),
+                torch.zeros_like(challenge_mass),
+            )
+            weighted = (
+                replay_slots.float() * replay_per_slot[:, None]
+                + challenge_slots.float() * challenge_per_slot[:, None]
+                + preferred_slots.float() * frontier_mass[:, None]
+            )
+            sampling_weights = torch.where(
+                has_preferred[:, None], weighted, sampling_weights
+            )
+        selected_slots = torch.multinomial(sampling_weights, 1).squeeze(1)
         selected = self.enabled_terrain_indices[selected_slots]
+        selected_difficulty = torch.ones(count, device=self.device)
+        if preferred_index is not None:
+            challenge_sample = selected > preferred_index
+            selected_difficulty = torch.where(
+                selected == preferred_index,
+                preferred_difficulty,
+                selected_difficulty,
+            )
+            # 未来等级挑战只承担预适应作用，从该类地形的最易几何开始。
+            selected_difficulty = torch.where(
+                challenge_sample,
+                torch.zeros_like(selected_difficulty),
+                selected_difficulty,
+            )
         self.terrain_type[env_ids] = selected
+        self.terrain_difficulty[env_ids] = selected_difficulty
         unit = torch.rand(count, device=self.device)
         amplitude = torch.zeros(count, device=self.device)
 
@@ -217,7 +390,19 @@ class SimulatedLocalMap:
             amplitude,
         )
         amplitude = torch.where(selected == 4, sample_range(self.cfg.rough_amplitude_range_m), amplitude)
-        amplitude = torch.where(selected == 5, sample_range(self.cfg.pit_depth_range_m), amplitude)
+        pit_depth_minimum, pit_depth_maximum = self.cfg.pit_depth_range_m
+        progressive_pit_depth_maximum = (
+            self.cfg.pit_curriculum_start_depth_max_m
+            + selected_difficulty
+            * (
+                pit_depth_maximum
+                - self.cfg.pit_curriculum_start_depth_max_m
+            )
+        )
+        pit_depth = pit_depth_minimum + (
+            progressive_pit_depth_maximum - pit_depth_minimum
+        ) * torch.rand(count, device=self.device)
+        amplitude = torch.where(selected == 5, pit_depth, amplitude)
         amplitude = torch.where(
             (selected == 6) | (selected == 7), sample_range(self.cfg.obstacle_height_range_m), amplitude
         )
@@ -229,7 +414,42 @@ class SimulatedLocalMap:
         self.feature_x[env_ids] = feature_distance * torch.cos(route_yaw)
         self.feature_y[env_ids] = feature_distance * torch.sin(route_yaw)
         width_min, width_max = self.cfg.step_width_range_m
-        self.feature_width[env_ids] = width_min + (width_max - width_min) * torch.rand(count, device=self.device)
+        feature_width = width_min + (width_max - width_min) * torch.rand(
+            count, device=self.device
+        )
+        pit_width_minimum, pit_width_maximum = self.cfg.pit_half_width_range_m
+        progressive_pit_width_maximum = (
+            self.cfg.pit_curriculum_start_half_width_max_m
+            + selected_difficulty
+            * (
+                pit_width_maximum
+                - self.cfg.pit_curriculum_start_half_width_max_m
+            )
+        )
+        pit_width = pit_width_minimum + (
+            progressive_pit_width_maximum - pit_width_minimum
+        ) * torch.rand(count, device=self.device)
+        self.feature_width[env_ids] = torch.where(
+            selected == 5, pit_width, feature_width
+        )
+        barrier_min, barrier_max = self.cfg.barrier_half_width_range_m
+        barrier_width = barrier_min + (
+            barrier_max - barrier_min
+        ) * torch.rand(count, device=self.device)
+        progressive_barrier_scale = (
+            self.cfg.challenge_barrier_width_scale
+            + selected_difficulty
+            * (1.0 - self.cfg.challenge_barrier_width_scale)
+        )
+        uses_barrier_width = (
+            (selected == 6) | (selected == 8) | (selected == 9)
+        )
+        barrier_width = torch.where(
+            uses_barrier_width,
+            barrier_width * progressive_barrier_scale,
+            barrier_width,
+        )
+        self.barrier_half_width[env_ids] = barrier_width
         friction_min, friction_max = self.cfg.friction_range
         self.friction[env_ids] = friction_min + (friction_max - friction_min) * torch.rand(
             count, device=self.device
@@ -257,8 +477,6 @@ class SimulatedLocalMap:
 
         if robot_pose.ndim != 2 or robot_pose.shape[-1] != 3:
             raise ValueError("robot_pose必须为[B,3]")
-        if minimum_distance_m <= 0.0 or maximum_distance_m <= minimum_distance_m:
-            raise ValueError("局部目标距离范围无效")
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
@@ -266,16 +484,54 @@ class SimulatedLocalMap:
             raise ValueError("robot_pose必须与env_ids等长")
 
         count = env_ids.numel()
-        distance = minimum_distance_m + (maximum_distance_m - minimum_distance_m) * torch.rand(
-            count, device=self.device
+        minimum_distance = torch.as_tensor(
+            minimum_distance_m, dtype=robot_pose.dtype, device=self.device
         )
+        maximum_distance = torch.as_tensor(
+            maximum_distance_m, dtype=robot_pose.dtype, device=self.device
+        )
+        if minimum_distance.ndim == 0:
+            minimum_distance = minimum_distance.expand(count)
+        if maximum_distance.ndim == 0:
+            maximum_distance = maximum_distance.expand(count)
+        if (
+            minimum_distance.shape != (count,)
+            or maximum_distance.shape != (count,)
+            or torch.any(minimum_distance < 0.0)
+            or torch.any(maximum_distance <= minimum_distance)
+        ):
+            raise ValueError("局部目标距离范围无效")
+        pit_minimum_distance = (
+            0.8
+            + self.feature_width[env_ids]
+            + self.cfg.pit_goal_clearance_m
+        )
+        pit_minimum_distance = torch.maximum(
+            pit_minimum_distance,
+            (
+                self.feature_width[env_ids]
+                + self.cfg.pit_goal_clearance_m
+            )
+            / 0.55,
+        )
+        effective_minimum_distance = torch.where(
+            self.terrain_type[env_ids] == 5,
+            torch.maximum(minimum_distance, pit_minimum_distance),
+            minimum_distance,
+        )
+        if torch.any(maximum_distance <= effective_minimum_distance):
+            raise ValueError("目标距离上限不足以把目标放置在pit远端安全区域")
+        distance = effective_minimum_distance + (
+            maximum_distance - effective_minimum_distance
+        ) * torch.rand(count, device=self.device)
         route_yaw = self.route_yaw[env_ids]
         forward = torch.stack((torch.cos(route_yaw), torch.sin(route_yaw)), dim=-1)
         lateral = torch.stack((-torch.sin(route_yaw), torch.cos(route_yaw)), dim=-1)
         goal_lateral = 0.15 * (2.0 * torch.rand(count, device=self.device) - 1.0)
         goals = robot_pose[:, :2] + distance[:, None] * forward + goal_lateral[:, None] * lateral
 
-        feature_distance = torch.clamp(0.45 * distance, min=0.8, max=1.8)
+        feature_distance = torch.clamp(0.45 * distance, min=0.8, max=4.0)
+        feature_distance = torch.minimum(feature_distance, 0.75 * distance)
         feature_lateral = 0.08 * (2.0 * torch.rand(count, device=self.device) - 1.0)
         feature_xy = (
             robot_pose[:, :2]
@@ -286,6 +542,86 @@ class SimulatedLocalMap:
         self.feature_y[env_ids] = feature_xy[:, 1]
         self.feature_yaw[env_ids] = route_yaw
         return goals
+
+    def navigation_potential(self, pose, goal_xy, env_ids=None):
+        """Return obstacle-aware remaining path length for reward shaping.
+
+        For a finite wall separating robot and goal, Euclidean distance points
+        directly through the obstacle. The potential instead uses the shorter
+        of the two collision-free routes around the wall endpoints. It falls
+        back to Euclidean distance once the straight segment is no longer
+        blocked and for every other terrain type.
+        """
+        import torch
+
+        if pose.ndim != 2 or pose.shape[1] != 3:
+            raise ValueError("pose形状必须为[B,3]")
+        if goal_xy.shape != (pose.shape[0], 2):
+            raise ValueError("goal_xy形状必须为[B,2]")
+        env_ids = self._environment_indices(pose.shape[0], env_ids)
+        direct = torch.linalg.vector_norm(goal_xy - pose[:, :2], dim=-1)
+
+        feature_x = self.feature_x[env_ids]
+        feature_y = self.feature_y[env_ids]
+        feature_yaw = self.feature_yaw[env_ids]
+        cosine = torch.cos(feature_yaw)
+        sine = torch.sin(feature_yaw)
+
+        robot_dx = pose[:, 0] - feature_x
+        robot_dy = pose[:, 1] - feature_y
+        goal_dx = goal_xy[:, 0] - feature_x
+        goal_dy = goal_xy[:, 1] - feature_y
+        robot_along = cosine * robot_dx + sine * robot_dy
+        robot_cross = -sine * robot_dx + cosine * robot_dy
+        goal_along = cosine * goal_dx + sine * goal_dy
+        goal_cross = -sine * goal_dx + cosine * goal_dy
+
+        denominator = goal_along - robot_along
+        safe_denominator = torch.where(
+            denominator.abs() > 1.0e-6,
+            denominator,
+            torch.ones_like(denominator),
+        )
+        intersection_fraction = -robot_along / safe_denominator
+        intersection_cross = robot_cross + intersection_fraction * (
+            goal_cross - robot_cross
+        )
+        endpoint_cross = (
+            self.barrier_half_width[env_ids]
+            + self.cfg.barrier_navigation_clearance_m
+        )
+        crosses_wall_plane = (
+            (denominator.abs() > 1.0e-6)
+            & (intersection_fraction > 0.0)
+            & (intersection_fraction < 1.0)
+        )
+        blocked = (
+            (self.terrain_type[env_ids] == 6)
+            & crosses_wall_plane
+            & (intersection_cross.abs() < endpoint_cross)
+        )
+
+        upper_robot = torch.sqrt(
+            robot_along.square()
+            + (robot_cross - endpoint_cross).square()
+        )
+        upper_goal = torch.sqrt(
+            goal_along.square()
+            + (goal_cross - endpoint_cross).square()
+        )
+        lower_robot = torch.sqrt(
+            robot_along.square()
+            + (robot_cross + endpoint_cross).square()
+        )
+        lower_goal = torch.sqrt(
+            goal_along.square()
+            + (goal_cross + endpoint_cross).square()
+        )
+        detour = torch.minimum(
+            upper_robot + upper_goal,
+            lower_robot + lower_goal,
+        )
+        return torch.where(blocked, detour, direct)
 
     def _environment_indices(self, batch_size: int, env_ids=None):
         import torch
@@ -327,6 +663,9 @@ class SimulatedLocalMap:
         feature_y = self._expanded(self.feature_y, dimensions, env_ids)
         feature_yaw = self._expanded(self.feature_yaw, dimensions, env_ids)
         width = self._expanded(self.feature_width, dimensions, env_ids)
+        barrier_half_width = self._expanded(
+            self.barrier_half_width, dimensions, env_ids
+        )
         delta_x = world_x - feature_x
         delta_y = world_y - feature_y
         along = torch.cos(feature_yaw) * delta_x + torch.sin(feature_yaw) * delta_y
@@ -355,7 +694,9 @@ class SimulatedLocalMap:
         ground = torch.where(pit & in_pit, -amplitude, ground)
 
         wall = terrain == 6
-        wall_cells = (torch.abs(along) < 0.10) & (torch.abs(cross) < 1.8)
+        wall_cells = (torch.abs(along) < 0.10) & (
+            torch.abs(cross) < barrier_half_width
+        )
         obstacle_range = torch.where(wall & wall_cells, amplitude, obstacle_range)
 
         pillar = terrain == 7
@@ -364,12 +705,19 @@ class SimulatedLocalMap:
 
         mixed = terrain == 8
         mixed_step = mixed & (along > 0.0) & (cross < 0.0)
-        mixed_wall = mixed & (torch.abs(along - 0.8) < 0.12) & (cross > 0.0)
+        mixed_wall = (
+            mixed
+            & (torch.abs(along - 0.8) < 0.12)
+            & (cross > 0.0)
+            & (cross < barrier_half_width)
+        )
         ground = torch.where(mixed_step, amplitude, ground)
         obstacle_range = torch.where(mixed_wall, 0.8 + amplitude, obstacle_range)
 
         multi_route = terrain == 9
-        low_barrier = (torch.abs(along) < 0.18) & (torch.abs(cross) < 1.6)
+        low_barrier = (torch.abs(along) < 0.18) & (
+            torch.abs(cross) < barrier_half_width
+        )
         obstacle_range = torch.where(multi_route & low_barrier, amplitude, obstacle_range)
         return ground, obstacle_range
 
@@ -485,6 +833,14 @@ class SimulatedLocalMap:
         if pose.ndim != 2 or pose.shape[1] != 3:
             raise ValueError("pose形状必须为[B,3]")
         env_ids = self._environment_indices(pose.shape[0], env_ids)
+        if self.lidar_sensor is not None:
+            return self.lidar_sensor.generate_map(
+                self,
+                pose,
+                velocity,
+                env_ids=env_ids,
+                return_ground_reference=return_ground_reference,
+            )
         batch_size = env_ids.numel()
         noisy_pose = pose.clone()
         noisy_pose[:, :2] += self.cfg.pose_xy_noise_std_m * torch.randn_like(noisy_pose[:, :2])
@@ -562,8 +918,7 @@ class SimulatedLocalMap:
             range_fill_value=self.cfg.range_fill_value,
             normalize=self.cfg.normalize_heights,
         )
-        if not torch.isfinite(result).all():
-            raise RuntimeError("仿真局部地图包含NaN或Inf")
+        require_finite(result, "仿真局部地图")
         if return_ground_reference:
             return result, ground_reference_z
         return result

@@ -9,7 +9,7 @@ def sample_local_goals(robot_pose, minimum_distance_m: float, maximum_distance_m
 
     if robot_pose.ndim != 2 or robot_pose.shape[-1] != 3:
         raise ValueError("robot_pose必须为[B,3]")
-    if minimum_distance_m <= 0.0 or maximum_distance_m <= minimum_distance_m:
+    if minimum_distance_m < 0.0 or maximum_distance_m <= minimum_distance_m:
         raise ValueError("局部目标距离范围无效")
     count = robot_pose.shape[0]
     distance = minimum_distance_m + (maximum_distance_m - minimum_distance_m) * torch.rand(

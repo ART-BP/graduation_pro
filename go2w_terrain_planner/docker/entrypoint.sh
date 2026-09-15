@@ -19,14 +19,17 @@ case "${COMMAND}" in
         run_python "${PROJECT_ROOT}/tests/smoke/smoke_env.py" --headless "$@"
         ;;
     train)
+        export GO2W_RUNTIME_CHECKS="${GO2W_RUNTIME_CHECKS:-0}"
         run_python "${PROJECT_ROOT}/scripts/rsl_rl/train.py" \
             --task Go2W-Terrain-Navigation-Direct-v0 --headless "$@"
         ;;
     play)
+        export GO2W_RUNTIME_CHECKS="${GO2W_RUNTIME_CHECKS:-0}"
         run_python "${PROJECT_ROOT}/scripts/rsl_rl/play.py" \
             --task Go2W-Terrain-Navigation-Direct-v0  "$@"
         ;;
     evaluate)
+        export GO2W_RUNTIME_CHECKS="${GO2W_RUNTIME_CHECKS:-0}"
         run_python "${PROJECT_ROOT}/scripts/evaluate.py" \
             --task Go2W-Terrain-Navigation-Direct-v0 --headless "$@"
         ;;

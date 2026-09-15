@@ -4,6 +4,40 @@ from __future__ import annotations
 
 import math
 
+from go2w_terrain_planner.utils.tensor_checks import require_finite
+
+_TARGET_GRID_CACHE: dict[tuple[str, str, int, int, float], tuple[object, object]] = {}
+
+
+def _target_grid(torch, device, dtype, height: int, width: int, extent_m: float):
+    """Return a cached metric grid for a fixed map geometry."""
+
+    key = (str(device), str(dtype), height, width, float(extent_m))
+    cached = _TARGET_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    x_axis = torch.linspace(
+        -0.5 * extent_m,
+        0.5 * extent_m,
+        height,
+        device=device,
+        dtype=dtype,
+    )
+    y_axis = torch.linspace(
+        -0.5 * extent_m,
+        0.5 * extent_m,
+        width,
+        device=device,
+        dtype=dtype,
+    )
+    target_x, target_y = torch.meshgrid(x_axis, y_axis, indexing="ij")
+    cached = (
+        target_x.view(1, 1, height, width),
+        target_y.view(1, 1, height, width),
+    )
+    _TARGET_GRID_CACHE[key] = cached
+    return cached
+
 
 def wrap_angle(angle):
     """Wrap NumPy scalars/arrays or torch tensors to ``[-pi, pi)``."""
@@ -109,11 +143,14 @@ def warp_map_sequence(
     batch, sequence, _, height, width = maps.shape
     device = maps.device
     dtype = maps.dtype
-    x_axis = torch.linspace(-0.5 * extent_m, 0.5 * extent_m, height, device=device, dtype=dtype)
-    y_axis = torch.linspace(-0.5 * extent_m, 0.5 * extent_m, width, device=device, dtype=dtype)
-    target_x, target_y = torch.meshgrid(x_axis, y_axis, indexing="ij")
-    target_x = target_x.view(1, 1, height, width)
-    target_y = target_y.view(1, 1, height, width)
+    target_x, target_y = _target_grid(
+        torch,
+        device,
+        dtype,
+        height,
+        width,
+        extent_m,
+    )
 
     target_yaw = target_pose[:, 2].view(batch, 1, 1, 1)
     world_x = (
@@ -138,27 +175,33 @@ def warp_map_sequence(
     grid = torch.stack((grid_column, grid_row), dim=-1).reshape(batch * sequence, height, width, 2)
     flat = maps.reshape(batch * sequence, 4, height, width)
     validity = flat[:, 3:4]
-    warped_weight = functional.grid_sample(
-        validity, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+    bilinear = functional.grid_sample(
+        torch.cat((flat[:, 0:1] * validity, validity), dim=1),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
     )
-    weighted_ground = functional.grid_sample(
-        flat[:, 0:1] * validity, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-    )
+    weighted_ground = bilinear[:, 0:1]
+    warped_weight = bilinear[:, 1:2]
     ground = torch.where(
         warped_weight > 1.0e-6,
         weighted_ground / torch.clamp(warped_weight, min=1.0e-6),
         torch.zeros_like(weighted_ground),
     )
-    nearest_validity = functional.grid_sample(
-        validity, grid, mode="nearest", padding_mode="zeros", align_corners=True
+    nearest = functional.grid_sample(
+        flat[:, 1:],
+        grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=True,
     )
-    height_range = functional.grid_sample(
-        flat[:, 1:2], grid, mode="nearest", padding_mode="zeros", align_corners=True
-    )
+    height_range = nearest[:, 0:1]
+    masks = nearest[:, 1:]
+    nearest_validity = masks[:, 1:2]
     height_range = torch.where(
         nearest_validity > 0.5, height_range, torch.zeros_like(height_range)
     )
-    masks = functional.grid_sample(flat[:, 2:], grid, mode="nearest", padding_mode="zeros", align_corners=True)
     result = torch.cat((ground, height_range, masks), dim=1).reshape(batch, sequence, 4, height, width)
     # Preserve frames that are already expressed in the target frame exactly.
     # This avoids amplified round-off when a synthetic validity channel is very
@@ -180,8 +223,7 @@ def warp_map_sequence(
         result[:, :, 0] = torch.where(
             result[:, :, 3] > 0.5, shifted_ground, result[:, :, 0]
         )
-    if not torch.isfinite(result).all():
-        raise RuntimeError("地图对齐结果包含NaN或Inf")
+    require_finite(result, "地图对齐结果")
     return result
 
 

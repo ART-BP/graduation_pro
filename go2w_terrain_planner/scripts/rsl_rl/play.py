@@ -29,6 +29,18 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
+    "--terrain-min-level",
+    type=int,
+    default=2,
+    help="Minimum sampled terrain index; default 2 skips flat and ramp.",
+)
+parser.add_argument(
+    "--terrain-max-level",
+    type=int,
+    default=9,
+    help="Maximum sampled terrain index.",
+)
+parser.add_argument(
     "--project-config-dir",
     "--project_config_dir",
     dest="project_config_dir",
@@ -88,7 +100,11 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import go2w_terrain_planner.tasks  # noqa: F401
 from go2w_terrain_planner.models import Go2wActorCritic
-from go2w_terrain_planner.utils.config_loader import apply_project_config, load_project_config
+from go2w_terrain_planner.utils.config_loader import (
+    apply_project_config,
+    apply_terrain_sampling_range,
+    load_project_config,
+)
 
 rsl_on_policy_runner.Go2wActorCritic = Go2wActorCritic
 
@@ -102,6 +118,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     project_config = load_project_config(args_cli.project_config_dir)
     apply_project_config(env_cfg, agent_cfg, project_config, args_cli.project_config_dir)
+    apply_terrain_sampling_range(
+        env_cfg,
+        args_cli.terrain_min_level,
+        args_cli.terrain_max_level,
+    )
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else min(4, env_cfg.scene.num_envs)

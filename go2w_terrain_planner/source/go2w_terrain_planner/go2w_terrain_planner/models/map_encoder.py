@@ -68,51 +68,84 @@ class OnnxFriendlyAdaptiveAvgPool2d(nn.Module):
 
 
 class MapEncoder(nn.Module):
-    def __init__(self, input_channels: int = 4, feature_dim: int = 128) -> None:
+    def __init__(
+        self,
+        input_channels: int = 4,
+        feature_dim: int = 192,
+        *,
+        encoder_channels: tuple[int, int, int, int] | list[int] = (24, 48, 96, 128),
+        spatial_pool_size: int = 6,
+    ) -> None:
         super().__init__()
 
         self.input_channels = int(input_channels)
+        self.encoder_channels = tuple(int(value) for value in encoder_channels)
+        self.spatial_pool_size = int(spatial_pool_size)
+        if (
+            len(self.encoder_channels) != 4
+            or any(value <= 0 for value in self.encoder_channels)
+            or self.spatial_pool_size <= 0
+            or feature_dim <= 0
+        ):
+            raise ValueError("地图编码器通道数、池化尺寸和特征维度必须为正数")
+        channel_1, channel_2, channel_3, channel_4 = self.encoder_channels
 
         self.network = nn.Sequential(
             nn.Conv2d(
                 self.input_channels,
-                16,
+                channel_1,
                 kernel_size=5,
                 stride=2,
                 padding=2,
             ),
             nn.ELU(),
             nn.Conv2d(
-                16,
-                32,
+                channel_1,
+                channel_2,
                 kernel_size=3,
                 stride=2,
                 padding=1,
             ),
             nn.ELU(),
             nn.Conv2d(
-                32,
-                64,
+                channel_2,
+                channel_3,
                 kernel_size=3,
                 stride=2,
                 padding=1,
             ),
             nn.ELU(),
             nn.Conv2d(
-                64,
-                96,
+                channel_3,
+                channel_4,
                 kernel_size=3,
                 stride=2,
                 padding=1,
             ),
             nn.ELU(),
-            # Preserve a 4x4 coarse spatial layout while remaining compatible
-            # with dynamic-batch ONNX export.
-            OnnxFriendlyAdaptiveAvgPool2d((4, 4)),
+            # Use the fused PyTorch kernel during training. It is replaced by
+            # the slice-based equivalent only when preparing ONNX export.
+            nn.AdaptiveAvgPool2d(
+                (self.spatial_pool_size, self.spatial_pool_size)
+            ),
             nn.Flatten(),
-            nn.Linear(96 * 4 * 4, feature_dim),
+            nn.Linear(
+                channel_4
+                * self.spatial_pool_size
+                * self.spatial_pool_size,
+                feature_dim,
+            ),
             nn.ELU(),
         )
+
+    def prepare_for_onnx_export(self) -> None:
+        """Replace unsupported adaptive pooling without changing weights."""
+
+        for index, module in enumerate(self.network):
+            if isinstance(module, nn.AdaptiveAvgPool2d):
+                self.network[index] = OnnxFriendlyAdaptiveAvgPool2d(
+                    (self.spatial_pool_size, self.spatial_pool_size)
+                )
 
     def forward(self, maps: torch.Tensor) -> torch.Tensor:
         # Avoid tensor-to-Python-boolean warnings while tracing ONNX.
