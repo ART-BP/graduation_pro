@@ -1,9 +1,8 @@
-"""RSL-RL 3.1 compatible CNN-GRU actor-critic for flattened policy observations."""
+"""RSL-RL actor-critic with a compact terrain map and motion-history GRU."""
 
 from __future__ import annotations
 
 import os
-import warnings
 from typing import Any, NoReturn
 
 import torch
@@ -13,8 +12,7 @@ from torch.distributions import Normal
 
 from go2w_terrain_planner.utils.tensor_checks import runtime_checks_enabled
 
-from .map_encoder import MapEncoder
-from .temporal_encoder import TemporalEncoder
+from .map_encoder import CompactTerrainMapEncoder
 
 
 class Go2wActorCritic(nn.Module):
@@ -28,15 +26,17 @@ class Go2wActorCritic(nn.Module):
         obs_groups: dict[str, list[str]],
         num_actions: int,
         *,
-        map_history_length: int = 5,
-        map_channels: int = 4,
-        map_size: int = 100,
-        map_encoder_channels: list[int] | tuple[int, ...] = (24, 48, 96, 128),
-        map_pool_size: int = 6,
-        map_feature_dim: int = 192,
-        temporal_hidden_dim: int = 192,
-        auxiliary_hidden_dim: int = 96,
-        fusion_hidden_dim: int = 256,
+        map_channels: int = 7,
+        map_size: int = 200,
+        command_history_length: int = 4,
+        motion_history_length: int = 4,
+        architecture: str = "compact_map_motion_gru_v6",
+        map_encoder_channels: list[int] | tuple[int, ...] = (32, 64, 96, 128),
+        map_pool_size: int = 8,
+        map_feature_dim: int = 384,
+        motion_gru_hidden_dim: int = 128,
+        auxiliary_hidden_dim: int = 128,
+        fusion_hidden_dim: int = 384,
         critic_hidden_dims: list[int] | tuple[int, ...] = (256, 256),
         init_noise_std: float = 0.4,
         noise_std_type: str = "scalar",
@@ -51,7 +51,7 @@ class Go2wActorCritic(nn.Module):
         del kwargs, actor_obs_normalization, critic_obs_normalization
         super().__init__()
         if noise_std_type != "scalar":
-            raise ValueError("第一版Go2wActorCritic仅支持scalar动作标准差")
+            raise ValueError("Go2wActorCritic仅支持scalar动作标准差")
         if not (
             0.0 < minimum_action_std < init_noise_std < maximum_action_std
             and maximum_pre_tanh_mean > 0.0
@@ -65,30 +65,62 @@ class Go2wActorCritic(nn.Module):
         self.runtime_finite_checks = bool(runtime_finite_checks) or (
             "GO2W_RUNTIME_CHECKS" in os.environ and runtime_checks_enabled()
         )
-        self.map_history_length = map_history_length
-        self.map_channels = map_channels
-        self.map_size = map_size
-        self.map_flat_dim = map_history_length * map_channels * map_size * map_size
+        self.map_channels = int(map_channels)
+        self.map_size = int(map_size)
+        self.command_history_length = int(command_history_length)
+        self.motion_history_length = int(motion_history_length)
+        self.architecture = str(architecture)
+        if (
+            self.command_history_length <= 0
+            or self.motion_history_length != self.command_history_length
+            or motion_gru_hidden_dim <= 0
+        ):
+            raise ValueError("GRU要求指令历史与运动历史等长且维度为正")
+        self.map_flat_dim = self.map_channels * self.map_size * self.map_size
         actor_dim = sum(obs[name].shape[-1] for name in obs_groups["policy"])
-        if actor_dim <= self.map_flat_dim:
-            raise ValueError(f"policy观测维度{actor_dim}不足以容纳地图{self.map_flat_dim}")
-        self.auxiliary_dim = actor_dim - self.map_flat_dim
+        self.auxiliary_dim = (
+            3
+            + 2
+            + 2 * self.command_history_length
+            + 3 * self.motion_history_length
+        )
+        expected_actor_dim = self.map_flat_dim + self.auxiliary_dim
+        if actor_dim != expected_actor_dim:
+            raise ValueError(
+                "policy观测维度与紧凑地图/历史布局不一致："
+                f"actual={actor_dim}, expected={expected_actor_dim}"
+            )
 
-        self.map_encoder = MapEncoder(
-            map_channels,
-            map_feature_dim,
+        if self.architecture != "compact_map_motion_gru_v6":
+            raise ValueError("model.architecture必须为compact_map_motion_gru_v6")
+        self.map_encoder = CompactTerrainMapEncoder(
+            input_channels=self.map_channels,
+            map_size=self.map_size,
+            feature_dim=map_feature_dim,
             encoder_channels=map_encoder_channels,
             spatial_pool_size=map_pool_size,
         )
-        self.temporal_encoder = TemporalEncoder(map_feature_dim, temporal_hidden_dim)
+        map_output_dim = map_feature_dim
+        self.motion_gru = nn.GRU(
+            input_size=5,
+            hidden_size=motion_gru_hidden_dim,
+            batch_first=True,
+        )
         self.auxiliary_encoder = nn.Sequential(
-            nn.Linear(self.auxiliary_dim, auxiliary_hidden_dim),
+            nn.Linear(5, auxiliary_hidden_dim),
             nn.ELU(),
             nn.Linear(auxiliary_hidden_dim, auxiliary_hidden_dim),
             nn.ELU(),
         )
         self.actor_head = nn.Sequential(
-            nn.Linear(temporal_hidden_dim + auxiliary_hidden_dim, fusion_hidden_dim),
+            nn.Linear(
+                map_output_dim
+                + motion_gru_hidden_dim
+                + auxiliary_hidden_dim,
+                fusion_hidden_dim,
+            ),
+            nn.ELU(),
+            nn.Linear(fusion_hidden_dim, fusion_hidden_dim),
             nn.ELU(),
             nn.Linear(fusion_hidden_dim, num_actions),
         )
@@ -102,7 +134,6 @@ class Go2wActorCritic(nn.Module):
         critic_layers.append(nn.Linear(previous, 1))
         self.critic = nn.Sequential(*critic_layers)
         # ``std``保存无约束logit，实际标准差由sigmoid平滑映射到配置范围。
-        # 保留参数名是为了让旧checkpoint能够在load_state_dict中显式迁移。
         initial_std_logit = self._physical_std_to_logit(
             torch.tensor(init_noise_std, dtype=torch.float32)
         )
@@ -113,7 +144,7 @@ class Go2wActorCritic(nn.Module):
         )
         self.register_buffer(
             "_policy_architecture_version",
-            torch.tensor(2, dtype=torch.int64),
+            torch.tensor(6, dtype=torch.int64),
         )
         self.distribution: Normal | None = None
         self._pre_tanh_action: torch.Tensor | None = None
@@ -208,53 +239,39 @@ class Go2wActorCritic(nn.Module):
         )
 
         maps = map_observation.reshape(
-            batch,
-            self.map_history_length,
-            self.map_channels,
-            self.map_size,
-            self.map_size,
+            batch, self.map_channels, self.map_size, self.map_size
         )
 
-        map_encoder_input = maps.reshape(
-            -1,
-            self.map_channels,
-            self.map_size,
-            self.map_size,
-        )
-
+        # 辅助观测前三维固定为[目标距离, sin方位角, cos方位角]。
+        map_feature = self.map_encoder(maps, auxiliary[:, :3])
         self._check_finite_tensor(
-            "map_encoder_input",
-            map_encoder_input,
-        )
-
-        per_frame = self.map_encoder(map_encoder_input)
-
-        self._check_finite_tensor(
-            "map_encoder_output",
-            per_frame,
+            "compact_map_output",
+            map_feature,
             self.map_encoder,
         )
 
-        per_frame = per_frame.reshape(
-            batch,
-            self.map_history_length,
-            -1,
+        goal_velocity = auxiliary[:, :5]
+        command_start = 5
+        command_end = command_start + 2 * self.command_history_length
+        motion_end = command_end + 3 * self.motion_history_length
+        command_history = auxiliary[:, command_start:command_end].reshape(
+            batch, self.command_history_length, 2
         )
-
+        motion_history = auxiliary[:, command_end:motion_end].reshape(
+            batch, self.motion_history_length, 3
+        )
+        temporal_sequence = torch.cat(
+            (motion_history, command_history), dim=-1
+        )
+        temporal_output, _ = self.motion_gru(temporal_sequence)
+        motion_feature = temporal_output[:, -1]
         self._check_finite_tensor(
-            "temporal_encoder_input",
-            per_frame,
+            "motion_gru_output",
+            motion_feature,
+            self.motion_gru,
         )
 
-        temporal = self.temporal_encoder(per_frame)
-
-        self._check_finite_tensor(
-            "temporal_encoder_output",
-            temporal,
-            self.temporal_encoder,
-        )
-
-        auxiliary_feature = self.auxiliary_encoder(auxiliary)
+        auxiliary_feature = self.auxiliary_encoder(goal_velocity)
 
         self._check_finite_tensor(
             "auxiliary_encoder_output",
@@ -263,7 +280,7 @@ class Go2wActorCritic(nn.Module):
         )
 
         fused_feature = torch.cat(
-            (temporal, auxiliary_feature),
+            (map_feature, motion_feature, auxiliary_feature),
             dim=-1,
         )
 
@@ -370,23 +387,6 @@ class Go2wActorCritic(nn.Module):
     def update_normalization(self, obs) -> None:
         del obs
 
-    def load_state_dict(self, state_dict, strict: bool = True):
-        migrated = state_dict.copy()
-        version_key = "_action_std_parameterization_version"
-        if version_key not in migrated:
-            # 第一、二版checkpoint中的``std``直接表示物理标准差。旧训练
-            # 常把它锁死在上限，因此迁移时有意重置探索强度，而不继承坏状态。
-            if "std" in migrated:
-                migrated["std"] = self.std.detach().clone()
-            migrated[version_key] = self._action_std_parameterization_version.clone()
-            warnings.warn(
-                "旧动作标准差checkpoint已迁移；探索标准差重置为当前配置初值",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return super().load_state_dict(migrated, strict=strict)
-
-
 class ActorExportWrapper(nn.Module):
     """ONNX wrapper that emits deployable physical ``[v_cmd,w_cmd]`` values."""
 
@@ -404,4 +404,8 @@ class ActorExportWrapper(nn.Module):
 
     def forward(self, policy_observation: torch.Tensor) -> torch.Tensor:
         normalized = self.actor_critic._actor_forward(policy_observation)
-        return self.action_min + 0.5 * (normalized + 1.0) * (self.action_max - self.action_min)
+        return torch.where(
+            normalized >= 0.0,
+            normalized * self.action_max,
+            (-normalized) * self.action_min,
+        )

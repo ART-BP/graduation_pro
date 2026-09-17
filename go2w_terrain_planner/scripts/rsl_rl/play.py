@@ -29,16 +29,16 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
-    "--terrain-min-level",
+    "--curriculum-min-stage",
     type=int,
-    default=2,
-    help="Minimum sampled terrain index; default 2 skips flat and ramp.",
+    default=1,
+    help="Minimum sampled capability stage.",
 )
 parser.add_argument(
-    "--terrain-max-level",
+    "--curriculum-max-stage",
     type=int,
     default=9,
-    help="Maximum sampled terrain index.",
+    help="Maximum sampled capability stage.",
 )
 parser.add_argument(
     "--project-config-dir",
@@ -102,9 +102,10 @@ import go2w_terrain_planner.tasks  # noqa: F401
 from go2w_terrain_planner.models import Go2wActorCritic
 from go2w_terrain_planner.utils.config_loader import (
     apply_project_config,
-    apply_terrain_sampling_range,
+    apply_curriculum_stage_sampling_range,
     load_project_config,
 )
+from go2w_terrain_planner.utils.logging_utils import validate_checkpoint
 
 rsl_on_policy_runner.Go2wActorCritic = Go2wActorCritic
 
@@ -118,10 +119,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     project_config = load_project_config(args_cli.project_config_dir)
     apply_project_config(env_cfg, agent_cfg, project_config, args_cli.project_config_dir)
-    apply_terrain_sampling_range(
+    apply_curriculum_stage_sampling_range(
         env_cfg,
-        args_cli.terrain_min_level,
-        args_cli.terrain_max_level,
+        args_cli.curriculum_min_stage,
+        args_cli.curriculum_max_stage,
     )
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -151,6 +152,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = retrieve_file_path(args_cli.checkpoint)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    validate_checkpoint(
+        resume_path,
+        include_optimizer=False,
+        required_policy_architecture_version=6,
+    )
 
     log_dir = os.path.dirname(resume_path)
 
@@ -192,17 +199,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
-
-    # The CNN-GRU policy uses the project's explicit export command. Isaac
-    # Lab's generic RSL exporter assumes the stock MLP actor layout.
+    # Isaac Lab and RSL-RL versions are fixed by the container image.
+    policy_nn = runner.alg.policy
 
     dt = env.unwrapped.step_dt
 

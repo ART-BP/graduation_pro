@@ -3,37 +3,66 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from go2w_terrain_planner.models import ActorExportWrapper, Go2wActorCritic
-from go2w_terrain_planner.models.map_encoder import MapEncoder
+from go2w_terrain_planner.models.map_encoder import CompactTerrainMapEncoder
 
 
-def test_map_encoder_preserves_coarse_spatial_layout() -> None:
-    torch.manual_seed(0)
-    encoder = MapEncoder(input_channels=4, feature_dim=16).eval()
-    left = torch.zeros((1, 4, 64, 64))
-    right = torch.zeros_like(left)
-    left[:, 1, 24:32, 8:16] = 1.0
-    right[:, 1, 24:32, 40:48] = 1.0
+def test_compact_encoder_preserves_spatial_layout_and_change_layer() -> None:
+    torch.manual_seed(1)
+    encoder = CompactTerrainMapEncoder(
+        input_channels=7,
+        map_size=32,
+        feature_dim=48,
+        encoder_channels=(8, 16, 24, 32),
+        spatial_pool_size=4,
+    ).eval()
+    maps = torch.zeros((1, 7, 32, 32))
+    maps[:, 1, 12:18, 5:10] = 1.0
+    maps[:, 2:4, 12:18, 5:10] = 1.0
+    goal = torch.tensor([[0.6, 0.0, 1.0]])
 
-    left_feature = encoder(left)
-    right_feature = encoder(right)
+    original = encoder(maps, goal)
+    mirrored_maps = torch.flip(maps, dims=(-1,))
+    mirrored = encoder(mirrored_maps, goal)
+    changed = maps.clone()
+    changed[:, 4, 12:18, 5:10] = 1.0
+    changed_feature = encoder(changed, goal)
 
-    assert left_feature.shape == (1, 16)
-    assert encoder.spatial_pool_size == 6
-    assert encoder.network[-2].in_features == 128 * 6 * 6
-    assert not torch.allclose(left_feature, right_feature, atol=1.0e-6)
+    assert original.shape == (1, 48)
+    assert not torch.allclose(original, mirrored, atol=1.0e-6)
+    assert not torch.allclose(original, changed_feature, atol=1.0e-6)
+
+
+def test_compact_encoder_propagates_gradient_to_all_channels() -> None:
+    torch.manual_seed(2)
+    encoder = CompactTerrainMapEncoder(
+        input_channels=7,
+        map_size=16,
+        feature_dim=24,
+        encoder_channels=(8, 16, 24, 32),
+        spatial_pool_size=2,
+    )
+    maps = torch.randn((2, 7, 16, 16), requires_grad=True)
+    goal = torch.tensor([[0.5, 0.0, 1.0], [0.7, 1.0, 0.0]])
+
+    encoder(maps, goal).square().mean().backward()
+
+    assert maps.grad is not None
+    per_channel_gradient = maps.grad.abs().sum(dim=(0, 2, 3))
+    assert torch.all(per_channel_gradient > 0.0)
 
 
 def test_actor_critic_forward_and_action_bounds() -> None:
-    history, channels, size, auxiliary = 3, 4, 16, 11
-    policy_dim = history * channels * size * size + auxiliary
+    history, channels, size, auxiliary = 2, 7, 16, 15
+    policy_dim = channels * size * size + auxiliary
     obs = {"policy": torch.zeros((2, policy_dim)), "critic": torch.zeros((2, 7))}
     model = Go2wActorCritic(
         obs,
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
         map_channels=channels,
         map_size=size,
+        command_history_length=history,
+        motion_history_length=history,
         critic_hidden_dims=[16],
     )
     action = model.act_inference(obs)
@@ -53,19 +82,24 @@ def test_actor_critic_forward_and_action_bounds() -> None:
     assert command.shape == (2, 2)
     assert torch.all(command[:, 0] >= -0.2) and torch.all(command[:, 0] <= 0.8)
     assert torch.all(command[:, 1] >= -1.0) and torch.all(command[:, 1] <= 1.0)
+    with torch.no_grad():
+        model.actor_head[-1].weight.zero_()
+        model.actor_head[-1].bias.zero_()
+    assert torch.equal(wrapper(obs["policy"]), torch.zeros((2, 2)))
 
 
 def test_saturated_actor_head_keeps_distribution_and_log_probability_finite() -> None:
-    history, channels, size, auxiliary = 3, 4, 16, 11
-    policy_dim = history * channels * size * size + auxiliary
+    history, channels, size, auxiliary = 2, 7, 16, 15
+    policy_dim = channels * size * size + auxiliary
     obs = {"policy": torch.zeros((2, policy_dim)), "critic": torch.zeros((2, 7))}
     model = Go2wActorCritic(
         obs,
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
         map_channels=channels,
         map_size=size,
+        command_history_length=history,
+        motion_history_length=history,
         critic_hidden_dims=[16],
         maximum_pre_tanh_mean=2.5,
     )
@@ -85,16 +119,17 @@ def test_saturated_actor_head_keeps_distribution_and_log_probability_finite() ->
 
 
 def test_action_std_has_gradient_near_configured_upper_bound() -> None:
-    history, channels, size, auxiliary = 3, 4, 16, 11
-    policy_dim = history * channels * size * size + auxiliary
+    history, channels, size, auxiliary = 2, 7, 16, 15
+    policy_dim = channels * size * size + auxiliary
     obs = {"policy": torch.zeros((2, policy_dim)), "critic": torch.zeros((2, 7))}
     model = Go2wActorCritic(
         obs,
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
         map_channels=channels,
         map_size=size,
+        command_history_length=history,
+        motion_history_length=history,
         critic_hidden_dims=[16],
     )
     with torch.no_grad():
@@ -111,16 +146,17 @@ def test_action_std_has_gradient_near_configured_upper_bound() -> None:
 
 def test_squashed_entropy_propagates_gradient_to_actor_mean() -> None:
     torch.manual_seed(3)
-    history, channels, size, auxiliary = 3, 4, 16, 11
-    policy_dim = history * channels * size * size + auxiliary
+    history, channels, size, auxiliary = 2, 7, 16, 15
+    policy_dim = channels * size * size + auxiliary
     obs = {"policy": torch.zeros((8, policy_dim)), "critic": torch.zeros((8, 7))}
     model = Go2wActorCritic(
         obs,
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
         map_channels=channels,
         map_size=size,
+        command_history_length=history,
+        motion_history_length=history,
         critic_hidden_dims=[16],
     )
 
@@ -133,44 +169,63 @@ def test_squashed_entropy_propagates_gradient_to_actor_mean() -> None:
     assert torch.any(actor_bias_gradient.abs() > 0.0)
 
 
-def test_legacy_checkpoint_resets_broken_physical_std() -> None:
-    history, channels, size, auxiliary = 3, 4, 16, 11
-    policy_dim = history * channels * size * size + auxiliary
-    obs = {"policy": torch.zeros((1, policy_dim)), "critic": torch.zeros((1, 7))}
+def test_motion_gru_preserves_sequence_order_and_receives_gradient() -> None:
+    torch.manual_seed(9)
+    history, channels, size = 2, 7, 16
+    auxiliary = 3 + 2 + 2 * history + 3 * history
+    policy_dim = channels * size * size + auxiliary
+    first = torch.zeros((1, policy_dim))
+    second = first.clone()
+    map_end = channels * size * size
+    motion_start = map_end + 3 + 2 + 2 * history
+    first[:, motion_start:] = torch.tensor([[0.8, 0.0, 0.2, -0.3, 0.1, -0.4]])
+    second[:, motion_start:] = first[:, motion_start:].reshape(1, history, 3).flip(1).flatten(1)
     model = Go2wActorCritic(
-        obs,
+        {"policy": first, "critic": torch.zeros((1, 7))},
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
         map_channels=channels,
         map_size=size,
+        command_history_length=history,
+        motion_history_length=history,
         critic_hidden_dims=[16],
     )
-    legacy_state = model.state_dict()
-    legacy_state.pop("_action_std_parameterization_version")
-    legacy_state["std"] = torch.ones_like(legacy_state["std"])
 
-    restored = Go2wActorCritic(
-        obs,
-        {"policy": ["policy"], "critic": ["critic"]},
-        2,
-        map_history_length=history,
-        map_channels=channels,
-        map_size=size,
-        critic_hidden_dims=[16],
+    first_mean = model._actor_raw_mean(first)
+    second_mean = model._actor_raw_mean(second)
+    first_mean.sum().backward()
+
+    assert not torch.allclose(first_mean, second_mean, atol=1.0e-6)
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.motion_gru.parameters()
     )
-    with pytest.warns(RuntimeWarning, match="旧动作标准差"):
-        restored.load_state_dict(legacy_state)
 
-    assert restored._bounded_action_std().mean().item() == pytest.approx(0.4)
+
+def test_removed_full_map_stack_architecture_is_rejected() -> None:
+    history, channels, size, auxiliary = 2, 7, 16, 15
+    policy_dim = channels * size * size + auxiliary
+    obs = {"policy": torch.zeros((1, policy_dim)), "critic": torch.zeros((1, 7))}
+    with pytest.raises(ValueError, match="compact_map_motion_gru_v6"):
+        Go2wActorCritic(
+            obs,
+            {"policy": ["policy"], "critic": ["critic"]},
+            2,
+            map_channels=channels,
+            map_size=size,
+            command_history_length=history,
+            motion_history_length=history,
+            architecture="spatial_temporal_fpn_v5",
+            critic_hidden_dims=[16],
+        )
 
 
 def test_onnx_wrapper_supports_dynamic_batch(tmp_path) -> None:
     np = pytest.importorskip("numpy")
     ort = pytest.importorskip("onnxruntime")
     pytest.importorskip("onnx")
-    history, channels, size, auxiliary = 3, 4, 16, 11
-    policy_dim = history * channels * size * size + auxiliary
+    history, channels, size, auxiliary = 2, 7, 16, 15
+    policy_dim = channels * size * size + auxiliary
     observations = {
         "policy": torch.zeros((1, policy_dim)),
         "critic": torch.zeros((1, 7)),
@@ -179,9 +234,10 @@ def test_onnx_wrapper_supports_dynamic_batch(tmp_path) -> None:
         observations,
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
         map_channels=channels,
         map_size=size,
+        command_history_length=history,
+        motion_history_length=history,
         critic_hidden_dims=[16],
     )
     wrapper = ActorExportWrapper(model, (-0.2, -1.0), (0.8, 1.0)).eval()

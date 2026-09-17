@@ -12,10 +12,15 @@ sensor:
   time_jitter_std_s: 0.005
   lidar:
     channels: 16
+    # XT16在10 Hz下每帧保留32000个扫描槽；无回波槽在张量中为NaN。
+    points_per_frame: 32000
     # 当前为可配置的16线近似角；获得XT16标定表后直接替换该数组。
     vertical_angles_deg: [-15.0, -13.0, -11.0, -9.0, -7.0, -5.0, -3.0, -1.0,
                           1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0]
+    # 地形首回波先按2度锚点求交，再插值到每线2000个水平采样点；
+    # 避免32个并行环境直接执行约1.5亿次逐距离地形查询。
     horizontal_resolution_deg: 2.0
+    maximum_interpolation_range_difference_m: 0.50
     minimum_range_m: 0.20
     maximum_range_m: 12.0
     ray_step_m: 0.08
@@ -23,3 +28,18 @@ sensor:
     scan_frequency_hz: 10.0
     motion_distortion: true
     ray_chunk_size: 256
+    projection:
+      # 与local_map_ws保持相同的12 m输入裁剪和0.05 m内部高程栅格语义。
+      input_crop_length_x_m: 12.0
+      input_crop_length_y_m: 12.0
+      body_height_m: 0.35
+      vertical_min_offset_m: -1.5
+      vertical_max_offset_m: 1.5
+      ground_percentile: 0.10
+      span_lower_percentile: 0.05
+      span_upper_percentile: 0.95
+      minimum_points_per_cell: 1
+      height_quantization_m: 0.0001
+      # 对齐后只融合地面高度相差不超过12 cm的最密集时间簇。
+      maximum_ground_deviation_m: 0.12
+      fusion_span_percentile: 0.75

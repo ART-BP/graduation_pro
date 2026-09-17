@@ -35,6 +35,10 @@ class VelocityCommandAdapter:
             raise ValueError("线速度上下限无效")
         if self.limits.angular_min_radps >= self.limits.angular_max_radps:
             raise ValueError("角速度上下限无效")
+        if not self.limits.linear_min_mps <= 0.0 <= self.limits.linear_max_mps:
+            raise ValueError("零中心动作映射要求线速度范围包含0")
+        if not self.limits.angular_min_radps <= 0.0 <= self.limits.angular_max_radps:
+            raise ValueError("零中心动作映射要求角速度范围包含0")
 
     """输出归一化动作转化为实际动作"""
     def to_physical(self, normalized_action):
@@ -44,11 +48,17 @@ class VelocityCommandAdapter:
             raise ValueError("动作最后一维必须为2")
         require_finite(normalized_action, "归一化动作")
         action = torch.clamp(normalized_action, -1.0, 1.0)
-        linear = self.limits.linear_min_mps + 0.5 * (action[..., 0] + 1.0) * (
-            self.limits.linear_max_mps - self.limits.linear_min_mps
+        # 归一化动作0必须严格对应物理速度0。这样策略初始化、异常动作
+        # 清零和安全门控都不会意外产生向前速度。
+        linear = torch.where(
+            action[..., 0] >= 0.0,
+            action[..., 0] * self.limits.linear_max_mps,
+            (-action[..., 0]) * self.limits.linear_min_mps,
         )
-        angular = self.limits.angular_min_radps + 0.5 * (action[..., 1] + 1.0) * (
-            self.limits.angular_max_radps - self.limits.angular_min_radps
+        angular = torch.where(
+            action[..., 1] >= 0.0,
+            action[..., 1] * self.limits.angular_max_radps,
+            (-action[..., 1]) * self.limits.angular_min_radps,
         )
         return torch.stack((linear, angular), dim=-1)
 
@@ -87,7 +97,16 @@ class VelocityExecutionModel:
     def reset(self, env_ids) -> None:
         self.actual_velocity[env_ids] = 0.0
 
-    def step(self, command, terrain_resistance, friction, dt: float, entry_alignment=None, blocked=None):
+    def step(
+        self,
+        command,
+        terrain_resistance,
+        friction,
+        dt: float,
+        entry_alignment=None,
+        blocked=None,
+        randomization_scale=None,
+    ):
         import torch
 
         if command.shape != self.actual_velocity.shape:
@@ -111,9 +130,16 @@ class VelocityExecutionModel:
         delta = torch.clamp(desired_delta, -max_delta, max_delta)
         self.actual_velocity += delta
         if self.cfg.tracking_noise_std > 0.0:
+            if randomization_scale is None:
+                randomization_scale = torch.ones(
+                    command.shape[0], dtype=command.dtype, device=command.device
+                )
+            if randomization_scale.shape != (command.shape[0],):
+                raise ValueError("randomization_scale必须与环境数量一致")
             self.actual_velocity += (
                 self.cfg.tracking_noise_std
                 * (dt**0.5)
+                * randomization_scale[:, None]
                 * torch.randn_like(self.actual_velocity)
             )
         if blocked is not None:

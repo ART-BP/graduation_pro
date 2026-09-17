@@ -8,53 +8,12 @@ from pathlib import Path
 
 import yaml
 
+from go2w_terrain_planner.mapping.simulated_local_map import TERRAIN_NAMES
+
+from .observation_layout import ACTOR_MAP_CHANNELS, policy_observation_dimension
+
 
 CONFIG_NAMES = ("observation", "action", "reward", "terrain", "sensor", "training")
-
-DEFAULT_LIDAR_CONFIG = {
-    "channels": 16,
-    "vertical_angles_deg": [
-        -15.0,
-        -13.0,
-        -11.0,
-        -9.0,
-        -7.0,
-        -5.0,
-        -3.0,
-        -1.0,
-        1.0,
-        3.0,
-        5.0,
-        7.0,
-        9.0,
-        11.0,
-        13.0,
-        15.0,
-    ],
-    "horizontal_resolution_deg": 2.0,
-    "minimum_range_m": 0.20,
-    "maximum_range_m": 12.0,
-    "ray_step_m": 0.08,
-    "mount_height_m": 0.45,
-    "scan_frequency_hz": 10.0,
-    "motion_distortion": True,
-    "ray_chunk_size": 256,
-}
-
-
-def _apply_backward_compatible_defaults(config: dict) -> None:
-    """Keep pre-lidar run snapshots loadable for evaluation and export."""
-
-    sensor_cfg = config.get("sensor")
-    if not isinstance(sensor_cfg, dict):
-        return
-    # A historical snapshot without this key was trained with the dense
-    # analytic observation model. Never silently reinterpret it as lidar.
-    sensor_cfg.setdefault("observation_source", "analytic")
-    lidar_cfg = sensor_cfg.setdefault("lidar", {})
-    if isinstance(lidar_cfg, dict):
-        for key, value in DEFAULT_LIDAR_CONFIG.items():
-            lidar_cfg.setdefault(key, value.copy() if isinstance(value, list) else value)
 
 
 def default_config_directory() -> Path:
@@ -65,6 +24,7 @@ def default_config_directory() -> Path:
 
 
 def load_project_config(config_directory: str | Path | None = None) -> dict:
+    """ 读取全部参数，以字典返回 """
     directory = Path(config_directory) if config_directory is not None else default_config_directory()
     result: dict = {}
     for name in CONFIG_NAMES:
@@ -79,12 +39,12 @@ def load_project_config(config_directory: str | Path | None = None) -> dict:
         if overlap:
             raise ValueError(f"配置顶层键重复：{sorted(overlap)}")
         result.update(value)
-    _apply_backward_compatible_defaults(result)
     validate_project_config(result)
     return result
 
 
 def validate_project_config(config: dict) -> None:
+    """ 参数是否有效， 主要是参数大小范围等检查 """
     required_sections = {
         "map",
         "history",
@@ -106,6 +66,7 @@ def validate_project_config(config: dict) -> None:
         raise ValueError(f"缺少配置段：{sorted(missing)}")
 
     def require_positive(values: dict, keys: tuple[str, ...], section: str) -> None:
+        """value[key]必须都是正数"""
         for key in keys:
             value = values[key]
             if (
@@ -116,6 +77,7 @@ def validate_project_config(config: dict) -> None:
                 raise ValueError(f"{section}.{key}必须为有限正数")
 
     def require_range(bounds, name: str, *, minimum: float | None = None) -> None:
+        """检查bounds的上下限必须有效"""
         if (
             not isinstance(bounds, (list, tuple))
             or len(bounds) != 2
@@ -148,12 +110,14 @@ def validate_project_config(config: dict) -> None:
         rel_tol=1.0e-6,
     ):
         raise ValueError("source_size、source_resolution_m与extent_m不一致")
-    if map_cfg["history_length"] < 3 or map_cfg["history_length"] > 5:
-        raise ValueError("地图历史长度必须为3到5")
     if map_cfg["channels"] != 4:
-        raise ValueError("第一版地图通道数必须为4")
+        raise ValueError("地图通道数必须为4")
+    if map_cfg["actor_channels"] != ACTOR_MAP_CHANNELS:
+        raise ValueError(
+            f"Actor紧凑地图通道数必须为{ACTOR_MAP_CHANNELS}"
+        )
     if not map_cfg["normalize_heights"]:
-        raise ValueError("第一版时序高度补偿要求normalize_heights=true")
+        raise ValueError("时序高度补偿要求normalize_heights=true")
     for key in ("minimum_observed_ratio", "minimum_height_valid_ratio"):
         if not 0.0 <= map_cfg[key] <= 1.0:
             raise ValueError(f"{key}必须位于[0,1]")
@@ -162,10 +126,11 @@ def validate_project_config(config: dict) -> None:
         or map_cfg["observation_fusion_length"] > 20
     ):
         raise ValueError("单张地图快照的有效观测融合长度必须为2到20")
-    if history_cfg["command_length"] != map_cfg["history_length"] - 1:
-        raise ValueError("指令历史长度必须等于地图历史长度减1")
-    if history_cfg["motion_length"] != map_cfg["history_length"] - 1:
-        raise ValueError("运动历史长度必须等于地图历史长度减1")
+    if (
+        history_cfg["command_length"] <= 0
+        or history_cfg["motion_length"] != history_cfg["command_length"]
+    ):
+        raise ValueError("GRU要求指令历史与运动历史等长且大于0")
     action_cfg = config["action"]
     require_positive(
         action_cfg,
@@ -176,6 +141,10 @@ def validate_project_config(config: dict) -> None:
         raise ValueError("线速度范围无效")
     if action_cfg["angular_min_radps"] >= action_cfg["angular_max_radps"]:
         raise ValueError("角速度范围无效")
+    if not action_cfg["linear_min_mps"] <= 0.0 <= action_cfg["linear_max_mps"]:
+        raise ValueError("零中心动作映射要求线速度范围包含0")
+    if not action_cfg["angular_min_radps"] <= 0.0 <= action_cfg["angular_max_radps"]:
+        raise ValueError("零中心动作映射要求角速度范围包含0")
     execution_cfg = config["execution_model"]
     require_positive(
         execution_cfg,
@@ -196,26 +165,12 @@ def validate_project_config(config: dict) -> None:
         raise ValueError("maximum_terrain_speed_loss必须位于[0,1)")
 
     goal_cfg = config["goal"]
-    require_positive(
-        goal_cfg,
-        (
-            "maximum_distance_m",
-            "reset_minimum_distance_m",
-            "curriculum_start_maximum_m",
-        ),
-        "goal",
-    )
+    require_positive(goal_cfg, ("maximum_distance_m",), "goal")
     if (
         not isinstance(goal_cfg["minimum_distance_m"], (int, float))
         or not math.isfinite(goal_cfg["minimum_distance_m"])
         or goal_cfg["minimum_distance_m"] < 0.0
         or goal_cfg["minimum_distance_m"] >= goal_cfg["maximum_distance_m"]
-        or not (
-            goal_cfg["minimum_distance_m"]
-            <= goal_cfg["reset_minimum_distance_m"]
-            < goal_cfg["curriculum_start_maximum_m"]
-            <= goal_cfg["maximum_distance_m"]
-        )
     ):
         raise ValueError("局部目标距离范围无效")
 
@@ -237,8 +192,6 @@ def validate_project_config(config: dict) -> None:
     )
     if termination_cfg["fall_tilt_rad"] <= termination_cfg["maximum_tilt_rad"]:
         raise ValueError("跌倒角阈值必须大于失稳角阈值")
-    if goal_cfg["reset_minimum_distance_m"] <= termination_cfg["goal_tolerance_m"]:
-        raise ValueError("goal.reset_minimum_distance_m必须大于终点容差")
     if (
         termination_cfg["maximum_distance_from_origin_m"]
         <= goal_cfg["maximum_distance_m"]
@@ -290,7 +243,9 @@ def validate_project_config(config: dict) -> None:
     require_positive(
         lidar_cfg,
         (
+            "points_per_frame",
             "horizontal_resolution_deg",
+            "maximum_interpolation_range_difference_m",
             "maximum_range_m",
             "ray_step_m",
             "mount_height_m",
@@ -306,10 +261,39 @@ def validate_project_config(config: dict) -> None:
         or lidar_cfg["minimum_range_m"] >= lidar_cfg["maximum_range_m"]
         or lidar_cfg["ray_step_m"] > lidar_cfg["maximum_range_m"]
         or lidar_cfg["horizontal_resolution_deg"] > 20.0
+        or not isinstance(lidar_cfg["points_per_frame"], int)
+        or lidar_cfg["points_per_frame"] % channels != 0
         or not isinstance(lidar_cfg["ray_chunk_size"], int)
         or not isinstance(lidar_cfg["motion_distortion"], bool)
     ):
         raise ValueError("sensor.lidar量程、分辨率或扫描配置无效")
+    projection_cfg = lidar_cfg["projection"]
+    if not isinstance(projection_cfg, dict):
+        raise ValueError("sensor.lidar.projection必须为YAML映射")
+    require_positive(
+        projection_cfg,
+        (
+            "input_crop_length_x_m",
+            "input_crop_length_y_m",
+            "body_height_m",
+            "minimum_points_per_cell",
+            "height_quantization_m",
+            "maximum_ground_deviation_m",
+        ),
+        "sensor.lidar.projection",
+    )
+    if (
+        projection_cfg["vertical_max_offset_m"]
+        <= projection_cfg["vertical_min_offset_m"]
+        or not isinstance(projection_cfg["minimum_points_per_cell"], int)
+        or not 0.0 <= projection_cfg["ground_percentile"] <= 1.0
+        or not 0.0
+        <= projection_cfg["span_lower_percentile"]
+        <= projection_cfg["span_upper_percentile"]
+        <= 1.0
+        or not 0.0 <= projection_cfg["fusion_span_percentile"] <= 1.0
+    ):
+        raise ValueError("sensor.lidar.projection裁剪或分位数配置无效")
 
     terrain_cfg = config["terrain"]
     for key in (
@@ -320,12 +304,18 @@ def validate_project_config(config: dict) -> None:
         "pit_depth_range_m",
         "pit_half_width_range_m",
         "obstacle_height_range_m",
+        "low_obstacle_height_range_m",
         "barrier_half_width_range_m",
         "friction_range",
     ):
         require_range(terrain_cfg[key], f"terrain.{key}", minimum=0.0)
     if not terrain_cfg["enabled_types"]:
         raise ValueError("terrain.enabled_types不能为空")
+    if len(set(terrain_cfg["enabled_types"])) != len(terrain_cfg["enabled_types"]):
+        raise ValueError("terrain.enabled_types不能包含重复项")
+    unknown_terrains = set(terrain_cfg["enabled_types"]) - set(TERRAIN_NAMES)
+    if unknown_terrains:
+        raise ValueError(f"未知地形类型：{sorted(unknown_terrains)}")
     if not 0.0 < terrain_cfg["challenge_barrier_width_scale"] <= 1.0:
         raise ValueError("terrain.challenge_barrier_width_scale必须位于(0,1]")
     if terrain_cfg["barrier_navigation_clearance_m"] <= 0.0:
@@ -339,6 +329,9 @@ def validate_project_config(config: dict) -> None:
         and pit_width_minimum
         <= terrain_cfg["pit_curriculum_start_half_width_max_m"]
         <= pit_width_maximum
+        and pit_depth_minimum
+        <= terrain_cfg["pit_navigation_avoidance_depth_m"]
+        <= pit_depth_maximum
         and terrain_cfg["pit_goal_clearance_m"] > 0.0
     ):
         raise ValueError("terrain中的pit渐进课程参数无效")
@@ -350,14 +343,14 @@ def validate_project_config(config: dict) -> None:
     ):
         raise ValueError("课程回合数门槛必须大于0")
     if not (
-        0
+        1
         <= curriculum_cfg["minimum_level"]
         <= curriculum_cfg["initial_level"]
         <= curriculum_cfg["maximum_level"]
     ):
         raise ValueError("课程初始等级与最高等级无效")
-    if curriculum_cfg["maximum_level"] > 9:
-        raise ValueError("课程最高等级不能超过当前十类地形的索引范围")
+    if curriculum_cfg["maximum_level"] != 9:
+        raise ValueError("当前能力课程必须完整定义1至9阶段")
     if not (
         0.0
         <= curriculum_cfg["success_rate_down"]
@@ -386,6 +379,75 @@ def validate_project_config(config: dict) -> None:
         or curriculum_cfg["challenge_level_span"] <= 0
     ):
         raise ValueError("curriculum.challenge_level_span必须为正整数")
+    stages = curriculum_cfg.get("stages")
+    if not isinstance(stages, dict) or {int(key) for key in stages} != set(
+        range(1, 10)
+    ):
+        raise ValueError("curriculum.stages必须完整定义1至9阶段")
+    enabled_terrains = set(terrain_cfg["enabled_types"])
+    for stage in range(1, 10):
+        values = stages.get(stage, stages.get(str(stage)))
+        if not isinstance(values, dict) or not isinstance(values.get("name"), str):
+            raise ValueError(f"curriculum.stages.{stage}缺少阶段名称")
+        terrain_weights = values.get("terrain_weights")
+        if (
+            not isinstance(terrain_weights, dict)
+            or not terrain_weights
+            or not set(terrain_weights).issubset(enabled_terrains)
+            or any(
+                not isinstance(weight, (int, float))
+                or not math.isfinite(weight)
+                or weight < 0.0
+                for weight in terrain_weights.values()
+            )
+            or sum(terrain_weights.values()) <= 0.0
+        ):
+            raise ValueError(
+                f"curriculum.stages.{stage}.terrain_weights无效"
+            )
+        goal_bounds = values.get("goal_distance_m")
+        require_range(
+            goal_bounds,
+            f"curriculum.stages.{stage}.goal_distance_m",
+            minimum=0.0,
+        )
+        if (
+            goal_bounds[0] <= termination_cfg["goal_tolerance_m"]
+            or goal_bounds[0] < goal_cfg["minimum_distance_m"]
+            or goal_bounds[1] > goal_cfg["maximum_distance_m"]
+            or goal_bounds[0] >= goal_bounds[1]
+        ):
+            raise ValueError(
+                f"curriculum.stages.{stage}.goal_distance_m超出局部目标接口"
+            )
+        heading_range = values.get("heading_half_range_rad")
+        if (
+            not isinstance(heading_range, (int, float))
+            or not math.isfinite(heading_range)
+            or not 0.0 <= heading_range <= math.pi
+        ):
+            raise ValueError(
+                f"curriculum.stages.{stage}.heading_half_range_rad必须位于[0,pi]"
+            )
+        randomization_scale = values.get("domain_randomization_scale")
+        if (
+            not isinstance(randomization_scale, (int, float))
+            or not math.isfinite(randomization_scale)
+            or not 0.0 <= randomization_scale <= 1.0
+        ):
+            raise ValueError(
+                f"curriculum.stages.{stage}.domain_randomization_scale必须位于[0,1]"
+            )
+        geometry_range = values.get("geometry_difficulty_range")
+        require_range(
+            geometry_range,
+            f"curriculum.stages.{stage}.geometry_difficulty_range",
+            minimum=0.0,
+        )
+        if geometry_range[1] > 1.0:
+            raise ValueError(
+                f"curriculum.stages.{stage}.geometry_difficulty_range必须位于[0,1]"
+            )
 
     reward_cfg = config["reward"]
     for key in (
@@ -441,11 +503,13 @@ def validate_project_config(config: dict) -> None:
         raise ValueError("ppo.entropy_coef不能为负数")
 
     model_cfg = config["model"]
+    if model_cfg.get("architecture") != "compact_map_motion_gru_v6":
+        raise ValueError("model.architecture必须为compact_map_motion_gru_v6")
     require_positive(
         model_cfg,
         (
             "map_feature_dim",
-            "temporal_hidden_dim",
+            "motion_gru_hidden_dim",
             "auxiliary_hidden_dim",
             "fusion_hidden_dim",
             "map_pool_size",
@@ -465,6 +529,10 @@ def validate_project_config(config: dict) -> None:
         )
     ):
         raise ValueError("model.map_encoder_channels必须包含四个正整数")
+    if model_cfg["map_encoder_channels"][-1] % 4 != 0:
+        raise ValueError(
+            "compact_map_motion_gru_v6最后一级通道数必须为4的倍数"
+        )
     if not (
         model_cfg["minimum_action_std"]
         < model_cfg["initial_action_std"]
@@ -491,26 +559,19 @@ def apply_environment_config(env_cfg, config: dict, config_directory: str | Path
     env_cfg.map_extent_m = float(map_cfg["extent_m"])
     env_cfg.map_size = int(map_cfg["output_size"])
     env_cfg.map_channels = int(map_cfg["channels"])
-    env_cfg.map_history_length = int(map_cfg["history_length"])
+    env_cfg.actor_map_channels = int(map_cfg["actor_channels"])
     env_cfg.command_history_length = int(history_cfg["command_length"])
     env_cfg.motion_history_length = int(history_cfg["motion_length"])
     env_cfg.minimum_observed_ratio = float(map_cfg["minimum_observed_ratio"])
     env_cfg.minimum_height_valid_ratio = float(map_cfg["minimum_height_valid_ratio"])
-    env_cfg.observation_space = (
-        env_cfg.map_history_length * env_cfg.map_channels * env_cfg.map_size * env_cfg.map_size
-        + 3
-        + 2
-        + 2 * env_cfg.command_history_length
-        + 3 * env_cfg.motion_history_length
+    env_cfg.observation_space = policy_observation_dimension(
+        map_channels=env_cfg.actor_map_channels,
+        map_size=env_cfg.map_size,
+        command_history_length=env_cfg.command_history_length,
+        motion_history_length=env_cfg.motion_history_length,
     )
     env_cfg.local_goal_minimum_m = float(goal_cfg["minimum_distance_m"])
     env_cfg.local_goal_maximum_m = float(goal_cfg["maximum_distance_m"])
-    env_cfg.local_goal_reset_minimum_m = float(
-        goal_cfg["reset_minimum_distance_m"]
-    )
-    env_cfg.local_goal_curriculum_start_maximum_m = float(
-        goal_cfg["curriculum_start_maximum_m"]
-    )
     env_cfg.goal_tolerance_m = float(termination_cfg["goal_tolerance_m"])
     env_cfg.episode_length_s = float(termination_cfg["maximum_episode_s"])
     env_cfg.maximum_distance_m = float(termination_cfg["maximum_distance_from_origin_m"])
@@ -520,7 +581,7 @@ def apply_environment_config(env_cfg, config: dict, config_directory: str | Path
     env_cfg.fall_tilt_rad = float(termination_cfg["fall_tilt_rad"])
     env_cfg.stuck_timeout_s = float(termination_cfg["stuck_timeout_s"])
     env_cfg.maximum_bad_observation_steps = int(termination_cfg["maximum_bad_observation_steps"])
-    env_cfg.curriculum_maximum_terrain_index = int(curriculum_cfg["maximum_level"])
+    env_cfg.curriculum_maximum_stage = int(curriculum_cfg["maximum_level"])
     if config_directory is not None:
         env_cfg.project_config_directory = str(Path(config_directory).resolve())
 
@@ -528,27 +589,27 @@ def apply_environment_config(env_cfg, config: dict, config_directory: str | Path
     env_cfg.sim.device = str(training_cfg["device"])
 
 
-def apply_terrain_sampling_range(
+def apply_curriculum_stage_sampling_range(
     env_cfg,
-    minimum_index: int | None,
-    maximum_index: int | None,
+    minimum_stage: int | None,
+    maximum_stage: int | None,
 ) -> None:
-    """Override curriculum sampling for evaluation or short stress tests."""
-    if minimum_index is None and maximum_index is None:
+    """Override capability-stage sampling for evaluation or stress tests."""
+    if minimum_stage is None and maximum_stage is None:
         return
-    minimum = 0 if minimum_index is None else int(minimum_index)
+    minimum = 1 if minimum_stage is None else int(minimum_stage)
     maximum = (
-        int(env_cfg.curriculum_maximum_terrain_index)
-        if maximum_index is None
-        else int(maximum_index)
+        int(env_cfg.curriculum_maximum_stage)
+        if maximum_stage is None
+        else int(maximum_stage)
     )
-    if not 0 <= minimum <= maximum <= int(env_cfg.curriculum_maximum_terrain_index):
+    if not 1 <= minimum <= maximum <= int(env_cfg.curriculum_maximum_stage):
         raise ValueError(
-            "地形采样范围必须满足0 <= minimum <= maximum <= "
-            f"{env_cfg.curriculum_maximum_terrain_index}"
+            "课程阶段采样范围必须满足1 <= minimum <= maximum <= "
+            f"{env_cfg.curriculum_maximum_stage}"
         )
-    env_cfg.terrain_sampling_minimum_index = minimum
-    env_cfg.terrain_sampling_maximum_index = maximum
+    env_cfg.curriculum_sampling_minimum_stage = minimum
+    env_cfg.curriculum_sampling_maximum_stage = maximum
 
 
 def apply_project_config(env_cfg, agent_cfg, config: dict, config_directory: str | Path | None = None) -> None:
@@ -566,15 +627,19 @@ def apply_project_config(env_cfg, agent_cfg, config: dict, config_directory: str
     agent_cfg.experiment_name = str(runner_cfg["experiment_name"])
     agent_cfg.run_name = str(runner_cfg["run_name"])
     agent_cfg.clip_actions = runner_cfg["clip_actions"]
-    agent_cfg.policy.map_history_length = env_cfg.map_history_length
-    agent_cfg.policy.map_channels = env_cfg.map_channels
+    agent_cfg.policy.map_channels = env_cfg.actor_map_channels
     agent_cfg.policy.map_size = env_cfg.map_size
+    agent_cfg.policy.command_history_length = env_cfg.command_history_length
+    agent_cfg.policy.motion_history_length = env_cfg.motion_history_length
+    agent_cfg.policy.architecture = str(model_cfg["architecture"])
     agent_cfg.policy.map_encoder_channels = list(
         model_cfg["map_encoder_channels"]
     )
     agent_cfg.policy.map_pool_size = int(model_cfg["map_pool_size"])
     agent_cfg.policy.map_feature_dim = int(model_cfg["map_feature_dim"])
-    agent_cfg.policy.temporal_hidden_dim = int(model_cfg["temporal_hidden_dim"])
+    agent_cfg.policy.motion_gru_hidden_dim = int(
+        model_cfg["motion_gru_hidden_dim"]
+    )
     agent_cfg.policy.auxiliary_hidden_dim = int(model_cfg["auxiliary_hidden_dim"])
     agent_cfg.policy.fusion_hidden_dim = int(model_cfg["fusion_hidden_dim"])
     agent_cfg.policy.init_noise_std = float(model_cfg["initial_action_std"])

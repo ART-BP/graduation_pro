@@ -26,7 +26,15 @@ def test_temporal_buffer_reset_push_and_alignment() -> None:
         ground_reference,
     )
     aligned = buffer.aligned_maps(10.0)
+    latest_at_external_pose = buffer.aligned_maps_to(
+        pose,
+        ground_reference,
+        10.0,
+        history_count=1,
+    )
     assert aligned.shape == (2, 5, 4, 8, 8)
+    assert latest_at_external_pose.shape == (2, 1, 4, 8, 8)
+    assert torch.equal(latest_at_external_pose[:, 0], initial_map)
     assert buffer.commands.shape == (2, 4, 2)
     assert buffer.motion_history().shape == (2, 4, 3)
     assert torch.isfinite(aligned).all()

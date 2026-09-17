@@ -28,16 +28,16 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
-    "--terrain-min-level",
+    "--curriculum-min-stage",
     type=int,
     default=None,
-    help="Optional minimum terrain index for a short stress-training run.",
+    help="Optional minimum capability stage for a short stress-training run.",
 )
 parser.add_argument(
-    "--terrain-max-level",
+    "--curriculum-max-stage",
     type=int,
     default=None,
-    help="Optional maximum terrain index; setting either terrain bound bypasses curriculum sampling.",
+    help="Optional maximum capability stage; setting either bound bypasses curriculum sampling.",
 )
 parser.add_argument(
     "--finetune",
@@ -136,7 +136,7 @@ import go2w_terrain_planner.tasks  # noqa: F401
 from go2w_terrain_planner.models import Go2wActorCritic
 from go2w_terrain_planner.utils.config_loader import (
     apply_project_config,
-    apply_terrain_sampling_range,
+    apply_curriculum_stage_sampling_range,
     default_config_directory,
     load_project_config,
 )
@@ -163,10 +163,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Train with RSL-RL agent."""
     project_config = load_project_config(args_cli.project_config_dir)
     apply_project_config(env_cfg, agent_cfg, project_config, args_cli.project_config_dir)
-    apply_terrain_sampling_range(
+    apply_curriculum_stage_sampling_range(
         env_cfg,
-        args_cli.terrain_min_level,
-        args_cli.terrain_max_level,
+        args_cli.curriculum_min_stage,
+        args_cli.curriculum_max_stage,
     )
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -240,7 +240,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             required_action_std_parameterization_version=(
                 2 if load_optimizer else None
             ),
-            required_policy_architecture_version=2,
+            required_policy_architecture_version=6,
         )
 
     # specify directory for logging runs: {time-stamp}_{run_name}
@@ -311,24 +311,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner.current_learning_iteration = 0
         elif agent_cfg.resume and hasattr(task_environment, "curriculum"):
             curriculum_state = (
-                checkpoint_infos.get("terrain_curriculum")
+                checkpoint_infos.get("capability_curriculum")
                 if isinstance(checkpoint_infos, dict)
                 else None
             )
             if curriculum_state is None:
-                logger.warning(
-                    "Checkpoint不包含课程状态；将从当前配置的初始等级继续。"
+                raise RuntimeError(
+                    "严格--resume要求checkpoint包含当前版本的课程状态"
                 )
-            else:
-                task_environment.curriculum.load_state_dict(curriculum_state)
-                # 环境在runner构造时已经按初始课程生成过任务；恢复课程后立即
-                # 全量重置，避免续训的第一批rollout仍停留在初始难度。
-                env.reset()
-                print(
-                    "[INFO] Restored terrain curriculum: "
-                    f"mean_level={task_environment.curriculum.levels.float().mean().item():.2f}",
-                    flush=True,
-                )
+            task_environment.curriculum.load_state_dict(curriculum_state)
+            # 环境在runner构造时已经按初始课程生成过任务；恢复课程后立即
+            # 全量重置，避免续训的第一批rollout仍停留在初始难度。
+            env.reset()
+            print(
+                "[INFO] Restored capability curriculum: "
+                f"mean_level={task_environment.curriculum.levels.float().mean().item():.2f}",
+                flush=True,
+            )
         validate_module_parameters(runner.alg.policy, label="载入后的policy")
 
     # dump the configuration into log-directory
@@ -351,7 +350,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         validate_module_parameters(runner.alg.policy, label="待保存policy")
         checkpoint_infos = {} if infos is None else dict(infos)
         if hasattr(task_environment, "curriculum"):
-            checkpoint_infos["terrain_curriculum"] = (
+            checkpoint_infos["capability_curriculum"] = (
                 task_environment.curriculum.state_dict()
             )
         return original_save(path, infos=checkpoint_infos)
@@ -414,9 +413,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             curriculum = task_environment.curriculum
             frontier_difficulty = curriculum.frontier_difficulty()
             mean_level = float(curriculum.levels.float().mean().item())
-            mean_goal_level = float(
-                curriculum.goal_levels.float().mean().item()
-            )
             mean_frontier_difficulty = float(
                 frontier_difficulty.mean().item()
             )
@@ -445,7 +441,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     infos={
                         "best_training_success_ema": success_ema,
                         "best_training_mean_level": mean_level,
-                        "best_training_mean_goal_level": mean_goal_level,
                         "best_training_frontier_success_ema": frontier_success,
                         "best_training_frontier_difficulty": (
                             mean_frontier_difficulty

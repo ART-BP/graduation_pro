@@ -67,15 +67,37 @@ class TemporalGridBuffer:
         self.commands[:, -1] = command
 
     def aligned_maps(self, extent_m: float):
+        return self.aligned_maps_to(
+            self.poses[:, -1],
+            self.ground_references_z[:, -1],
+            extent_m,
+        )
+
+    def aligned_maps_to(
+        self,
+        target_pose,
+        target_ground_reference_z,
+        extent_m: float,
+        *,
+        history_count: int | None = None,
+    ):
+        """Align all or the most recent maps to an externally supplied pose."""
         from .coordinate_transform import warp_map_sequence
 
+        if history_count is None:
+            start = 0
+        elif not 1 <= history_count <= self.history_length:
+            raise ValueError("history_count必须位于[1, history_length]")
+        else:
+            start = self.history_length - history_count
+
         return warp_map_sequence(
-            self.maps,
-            self.poses,
-            self.poses[:, -1],
+            self.maps[:, start:],
+            self.poses[:, start:],
+            target_pose,
             extent_m,
-            source_ground_reference_z=self.ground_references_z,
-            target_ground_reference_z=self.ground_references_z[:, -1],
+            source_ground_reference_z=self.ground_references_z[:, start:],
+            target_ground_reference_z=target_ground_reference_z,
             normalized_ground_height_scale_m=self.normalized_ground_height_scale_m,
         )
 

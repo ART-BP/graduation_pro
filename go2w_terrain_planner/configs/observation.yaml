@@ -2,25 +2,26 @@ map:
   extent_m: 10.0
   source_resolution_m: 0.05
   source_size: 200
-  output_size: 100
-  history_length: 5
+  # 训练网络直接使用0.05 m源分辨率，不再在输入端降采样丢失小台阶。
+  output_size: 200
+  # Actor只接收当前4通道融合地图、变化、年龄和置信度，共7通道。
+  actor_channels: 7
   # 每张网络地图快照融合最近12次对齐观测，可保留十帧以前的信息。
   observation_fusion_length: 12
   channels: 4
   ground_fill_value: 0.0
   range_fill_value: 0.0
-  max_abs_relative_height_m: 3.0
+  # 地面层主要覆盖轮足可通过的起伏；独立高度差层仍覆盖0～3 m障碍。
+  max_abs_relative_height_m: 1.0
   max_height_range_m: 3.0
   normalize_heights: true
   minimum_observed_ratio: 0.05
   minimum_height_valid_ratio: 0.01
 goal:
-  # Actor局部目标接口覆盖0～10 m；episode重置时排除已进入终点容差的目标。
+  # Actor局部目标接口覆盖0～10 m；episode目标范围由九阶段课程分别定义。
   minimum_distance_m: 0.0
   maximum_distance_m: 10.0
-  reset_minimum_distance_m: 1.5
-  # 目标采样上限随地形课程由4 m逐步扩展到10 m。
-  curriculum_start_maximum_m: 4.0
 history:
+  # 指令与运动序列等长，由GRU按时间顺序编码。
   command_length: 4
   motion_length: 4

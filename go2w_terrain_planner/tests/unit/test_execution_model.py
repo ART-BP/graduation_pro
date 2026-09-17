@@ -18,6 +18,8 @@ def test_action_mapping_and_acceleration_limit() -> None:
     physical = adapter.to_physical(torch.tensor([[-1.0, -1.0], [1.0, 1.0]]))
     assert physical[0].tolist() == pytest.approx([-0.2, -1.0])
     assert physical[1].tolist() == pytest.approx([0.8, 1.0])
+    stopped = adapter.to_physical(torch.zeros((1, 2)))
+    assert stopped[0].tolist() == pytest.approx([0.0, 0.0])
     model = VelocityExecutionModel(2, "cpu", ExecutionModelConfig(tracking_noise_std=0.0))
     velocity = model.step(physical, torch.zeros(2), torch.ones(2), dt=0.1)
     assert torch.abs(velocity[:, 0]).max().item() <= 0.080001

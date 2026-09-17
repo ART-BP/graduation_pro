@@ -159,8 +159,8 @@ def validate_checkpoint(
                         pass
         if version_values != [required_action_std_parameterization_version]:
             raise RuntimeError(
-                "旧动作分布checkpoint不能严格--resume；"
-                "phase4扩大后的网络需要从头训练"
+                "checkpoint动作分布参数化版本与当前训练接口不一致，"
+                "不能严格--resume"
             )
     if required_policy_architecture_version is not None:
         version_values = []
@@ -173,8 +173,8 @@ def validate_checkpoint(
                         pass
         if version_values != [required_policy_architecture_version]:
             raise RuntimeError(
-                "checkpoint网络结构与phase4扩大后的地图编码器不兼容；"
-                "本版本需要从头训练"
+                "checkpoint网络结构与当前地图编码器不兼容；"
+                "请使用对应run目录中的配置评估，或从头训练新网络"
             )
 
 

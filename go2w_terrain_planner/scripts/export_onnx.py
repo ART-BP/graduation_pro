@@ -13,6 +13,10 @@ import os
 os.environ.setdefault("GO2W_SKIP_TASK_IMPORT", "1")
 
 from go2w_terrain_planner.models import ActorExportWrapper, Go2wActorCritic
+from go2w_terrain_planner.utils.observation_layout import (
+    CRITIC_OBSERVATION_DIMENSION,
+    policy_observation_dimension,
+)
 from go2w_terrain_planner.utils.config_loader import load_project_config
 from go2w_terrain_planner.utils.logging_utils import validate_checkpoint
 
@@ -32,32 +36,42 @@ def main() -> None:
     map_config = config["map"]
     history_config = config["history"]
     map_size = args.map_size if args.map_size is not None else int(map_config["output_size"])
-    history = int(map_config["history_length"])
-    policy_dim = (
-        history * int(map_config["channels"]) * map_size * map_size
-        + 3
-        + 2
-        + int(history_config["command_length"]) * 2
-        + int(history_config["motion_length"]) * 3
+    policy_dim = policy_observation_dimension(
+        map_channels=int(map_config["actor_channels"]),
+        map_size=map_size,
+        command_history_length=int(history_config["command_length"]),
+        motion_history_length=int(history_config["motion_length"]),
     )
     observations = {
         "policy": torch.zeros((1, policy_dim), dtype=torch.float32),
-        "critic": torch.zeros((1, 13), dtype=torch.float32),
+        "critic": torch.zeros(
+            (1, CRITIC_OBSERVATION_DIMENSION), dtype=torch.float32
+        ),
     }
     model = Go2wActorCritic(
         observations,
         {"policy": ["policy"], "critic": ["critic"]},
         2,
-        map_history_length=history,
-        map_channels=int(map_config["channels"]),
+        map_channels=int(map_config["actor_channels"]),
         map_size=map_size,
+        command_history_length=int(history_config["command_length"]),
+        motion_history_length=int(history_config["motion_length"]),
+        architecture=str(config["model"]["architecture"]),
+        map_encoder_channels=list(config["model"]["map_encoder_channels"]),
+        map_pool_size=int(config["model"]["map_pool_size"]),
         map_feature_dim=int(config["model"]["map_feature_dim"]),
-        temporal_hidden_dim=int(config["model"]["temporal_hidden_dim"]),
+        motion_gru_hidden_dim=int(
+            config["model"]["motion_gru_hidden_dim"]
+        ),
         auxiliary_hidden_dim=int(config["model"]["auxiliary_hidden_dim"]),
         fusion_hidden_dim=int(config["model"]["fusion_hidden_dim"]),
         critic_hidden_dims=list(config["model"]["critic_hidden_dims"]),
     )
-    validate_checkpoint(args.checkpoint, include_optimizer=False)
+    validate_checkpoint(
+        args.checkpoint,
+        include_optimizer=False,
+        required_policy_architecture_version=6,
+    )
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state = checkpoint.get("model_state_dict", checkpoint.get("model"))
     if state is None:

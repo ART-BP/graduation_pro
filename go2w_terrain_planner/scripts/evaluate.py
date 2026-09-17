@@ -23,16 +23,16 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--steps", type=int, default=2000)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument(
-    "--terrain-min-level",
+    "--curriculum-min-stage",
     type=int,
-    default=2,
-    help="Minimum sampled terrain index; default 2 skips flat and ramp.",
+    default=1,
+    help="Minimum sampled capability stage.",
 )
 parser.add_argument(
-    "--terrain-max-level",
+    "--curriculum-max-stage",
     type=int,
     default=9,
-    help="Maximum sampled terrain index.",
+    help="Maximum sampled capability stage.",
 )
 parser.add_argument("--project-config-dir", "--project_config_dir", dest="project_config_dir", default=None)
 cli_args.add_rsl_rl_args(parser)
@@ -56,7 +56,7 @@ from go2w_terrain_planner.models import Go2wActorCritic
 from go2w_terrain_planner.mapping.simulated_local_map import TERRAIN_NAMES
 from go2w_terrain_planner.utils.config_loader import (
     apply_project_config,
-    apply_terrain_sampling_range,
+    apply_curriculum_stage_sampling_range,
     load_project_config,
 )
 from go2w_terrain_planner.utils.logging_utils import validate_checkpoint
@@ -71,10 +71,10 @@ def main() -> None:
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     agent_cfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
     apply_project_config(env_cfg, agent_cfg, project_config, args_cli.project_config_dir)
-    apply_terrain_sampling_range(
+    apply_curriculum_stage_sampling_range(
         env_cfg,
-        args_cli.terrain_min_level,
-        args_cli.terrain_max_level,
+        args_cli.curriculum_min_stage,
+        args_cli.curriculum_max_stage,
     )
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -95,7 +95,11 @@ def main() -> None:
     )
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint不存在：{checkpoint}")
-    validate_checkpoint(checkpoint, include_optimizer=False)
+    validate_checkpoint(
+        checkpoint,
+        include_optimizer=False,
+        required_policy_architecture_version=6,
+    )
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -126,13 +130,21 @@ def main() -> None:
     )
     terrain_episode_counts = torch.zeros_like(terrain_step_counts)
     terrain_success_counts = torch.zeros_like(terrain_step_counts)
+    stage_step_counts = torch.zeros(
+        10, dtype=torch.long, device=env.unwrapped.device
+    )
+    stage_episode_counts = torch.zeros_like(stage_step_counts)
+    stage_success_counts = torch.zeros_like(stage_step_counts)
+    stage_names = dict(env.unwrapped.curriculum_schedule.stage_names)
     active_terrain = env.unwrapped.map_generator.terrain_type.clone()
+    active_stage = env.unwrapped.current_curriculum_stage.clone()
     started = time.perf_counter()
     with torch.inference_mode():
         for _ in range(args_cli.steps):
             terrain_step_counts += torch.bincount(
                 active_terrain, minlength=len(TERRAIN_NAMES)
             )
+            stage_step_counts += torch.bincount(active_stage, minlength=10)
             action = policy(observation)
             observation, reward, done, extras = env.step(action)
             if not torch.isfinite(reward).all() or not torch.isfinite(action).all():
@@ -145,6 +157,9 @@ def main() -> None:
             if completed_now:
                 terrain_episode_counts += torch.bincount(
                     active_terrain[done], minlength=len(TERRAIN_NAMES)
+                )
+                stage_episode_counts += torch.bincount(
+                    active_stage[done], minlength=10
                 )
                 completed_return_sum += float(episode_return[done].sum().item())
                 completed_length_sum += int(episode_length[done].sum().item())
@@ -170,7 +185,18 @@ def main() -> None:
                     terrain_success_counts[terrain_index] += int(
                         round(float(success_count))
                     )
+                for stage, stage_name in stage_names.items():
+                    key = f"Stage/{stage}_{stage_name}_success_count"
+                    if key not in episode_log:
+                        continue
+                    success_count = episode_log[key]
+                    if isinstance(success_count, torch.Tensor):
+                        success_count = float(success_count.item())
+                    stage_success_counts[stage] += int(
+                        round(float(success_count))
+                    )
             active_terrain.copy_(env.unwrapped.map_generator.terrain_type)
+            active_stage.copy_(env.unwrapped.current_curriculum_stage)
     elapsed = time.perf_counter() - started
     env.close()
 
@@ -182,9 +208,9 @@ def main() -> None:
         "seed": int(agent_cfg.seed),
         "num_envs": args_cli.num_envs,
         "steps_per_env": args_cli.steps,
-        "terrain_sampling_range": {
-            "minimum_index": args_cli.terrain_min_level,
-            "maximum_index": args_cli.terrain_max_level,
+        "curriculum_stage_sampling_range": {
+            "minimum_stage": args_cli.curriculum_min_stage,
+            "maximum_stage": args_cli.curriculum_max_stage,
         },
         "terrain_step_counts": {
             name: int(terrain_step_counts[index].item())
@@ -202,6 +228,23 @@ def main() -> None:
                 else None
             )
             for index, name in enumerate(TERRAIN_NAMES)
+        },
+        "curriculum_stage_step_counts": {
+            f"{stage}_{name}": int(stage_step_counts[stage].item())
+            for stage, name in stage_names.items()
+        },
+        "curriculum_stage_completed_episode_counts": {
+            f"{stage}_{name}": int(stage_episode_counts[stage].item())
+            for stage, name in stage_names.items()
+        },
+        "curriculum_stage_success_rates": {
+            f"{stage}_{name}": (
+                float(stage_success_counts[stage].item())
+                / int(stage_episode_counts[stage].item())
+                if stage_episode_counts[stage].item() > 0
+                else None
+            )
+            for stage, name in stage_names.items()
         },
         "mean_return_over_window": float(reward_sum.mean().item()),
         "mean_completed_episode_return": (

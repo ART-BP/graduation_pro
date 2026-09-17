@@ -1,7 +1,7 @@
 """Fast tensor-only approximation of the real rolling elevation-map interface.
 
 The terrain truth remains analytic for efficient curriculum randomization. The
-actor observation can either use the legacy dense analytic projection or an
+actor observation can either use a dense analytic ablation projection or an
 XT16-style first-return lidar scan projected into the same four map channels.
 """
 
@@ -25,29 +25,69 @@ TERRAIN_NAMES = (
     "pillar",
     "mixed",
     "multi_route",
+    "low_obstacle",
 )
 
 
-def fuse_aligned_map_history(aligned_maps):
-    """Robustly fuse aligned observations using the same semantics as the real map."""
+def fuse_aligned_map_history(
+    aligned_maps,
+    *,
+    maximum_ground_deviation: float = 0.04,
+    span_percentile: float = 0.75,
+):
+    """Fuse the densest temporally consistent ground cluster per cell."""
     import torch
 
     if aligned_maps.ndim != 5 or aligned_maps.shape[2] != 4:
         raise ValueError("aligned_maps必须为[B,T,4,H,W]")
+    if maximum_ground_deviation <= 0.0:
+        raise ValueError("maximum_ground_deviation必须大于0")
+    if not 0.0 <= span_percentile <= 1.0:
+        raise ValueError("span_percentile必须位于[0,1]")
     valid = aligned_maps[:, :, 3] > 0.5
-    count = valid.sum(dim=1)
+    ground_history = aligned_maps[:, :, 0]
+    history_length = aligned_maps.shape[1]
+    cluster_counts = []
+    for anchor_index in range(history_length):
+        anchor = ground_history[:, anchor_index : anchor_index + 1]
+        cluster_counts.append(
+            (
+                valid
+                & valid[:, anchor_index : anchor_index + 1]
+                & ((ground_history - anchor).abs() <= maximum_ground_deviation)
+            ).sum(dim=1)
+        )
+    cluster_counts = torch.stack(cluster_counts, dim=1)
+    recency = torch.arange(
+        history_length,
+        dtype=cluster_counts.dtype,
+        device=cluster_counts.device,
+    )[None, :, None, None]
+    anchor_score = cluster_counts * (history_length + 1) + recency
+    selected_anchor_index = anchor_score.argmax(dim=1, keepdim=True)
+    selected_ground = ground_history.gather(1, selected_anchor_index).squeeze(1)
+    consistent = valid & (
+        (ground_history - selected_ground[:, None]).abs()
+        <= maximum_ground_deviation
+    )
+    count = consistent.sum(dim=1)
     ground_samples = torch.where(
-        valid, aligned_maps[:, :, 0], torch.full_like(aligned_maps[:, :, 0], torch.inf)
+        consistent,
+        ground_history,
+        torch.full_like(ground_history, torch.inf),
     ).sort(dim=1).values
     ground_rank = ((count - 1).clamp(min=0) // 2).unsqueeze(1)
     ground = ground_samples.gather(1, ground_rank).squeeze(1)
 
     range_samples = torch.where(
-        valid, aligned_maps[:, :, 1], torch.full_like(aligned_maps[:, :, 1], torch.inf)
+        consistent,
+        aligned_maps[:, :, 1],
+        torch.full_like(aligned_maps[:, :, 1], torch.inf),
     ).sort(dim=1).values
     # 上四分位数保留稳定的局部高度突变，同时抑制单帧离群峰值。
     range_rank = torch.ceil(
-        0.75 * (count - 1).clamp(min=0).to(aligned_maps.dtype)
+        span_percentile
+        * (count - 1).clamp(min=0).to(aligned_maps.dtype)
     ).long().unsqueeze(1)
     height_range = range_samples.gather(1, range_rank).squeeze(1)
     observed = aligned_maps[:, :, 2].amax(dim=1)
@@ -86,8 +126,10 @@ class SimulatedMapConfig:
     pit_half_width_range_m: tuple[float, float] = (0.25, 0.60)
     pit_curriculum_start_depth_max_m: float = 0.12
     pit_curriculum_start_half_width_max_m: float = 0.35
+    pit_navigation_avoidance_depth_m: float = 0.18
     pit_goal_clearance_m: float = 0.80
     obstacle_height_range_m: tuple[float, float] = (0.55, 1.20)
+    low_obstacle_height_range_m: tuple[float, float] = (0.06, 0.20)
     barrier_half_width_range_m: tuple[float, float] = (0.40, 1.20)
     challenge_barrier_width_scale: float = 0.65
     barrier_navigation_clearance_m: float = 0.35
@@ -115,7 +157,13 @@ class TerrainTruthMetrics:
         import torch
 
         return torch.maximum(
-            torch.maximum(self.support_span_m, self.maximum_discontinuity_m),
+            torch.maximum(
+                torch.maximum(
+                    self.support_span_m,
+                    self.maximum_discontinuity_m,
+                ),
+                self.obstacle_height_m,
+            ),
             self.pit_depth_m,
         )
 
@@ -124,6 +172,15 @@ class TerrainTruthMetrics:
         import torch
 
         return torch.maximum(self.maximum_discontinuity_m, self.obstacle_height_m)
+
+
+@dataclass
+class NavigationGuidance:
+    """Privileged reward-shaping path solution around the active obstacle."""
+
+    potential_m: object
+    target_xy: object
+    blocked: object
 
 
 class SimulatedLocalMap:
@@ -156,6 +213,9 @@ class SimulatedLocalMap:
             and 0.0 < pit_width_minimum
             <= self.cfg.pit_curriculum_start_half_width_max_m
             <= pit_width_maximum
+            and pit_depth_minimum
+            <= self.cfg.pit_navigation_avoidance_depth_m
+            <= pit_depth_maximum
             and self.cfg.pit_goal_clearance_m > 0.0
             and self.cfg.barrier_navigation_clearance_m > 0.0
         ):
@@ -221,6 +281,8 @@ class SimulatedLocalMap:
         self.feature_width = torch.ones(num_envs, device=self.device)
         self.barrier_half_width = torch.ones(num_envs, device=self.device)
         self.terrain_difficulty = torch.ones(num_envs, device=self.device)
+        self.domain_randomization_scale = torch.zeros(num_envs, device=self.device)
+        self.traversal_direction = torch.ones(num_envs, device=self.device)
         self.friction = torch.ones(num_envs, device=self.device)
         self.occlusion_enabled = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self.occlusion_angle = torch.zeros(num_envs, device=self.device)
@@ -230,166 +292,100 @@ class SimulatedLocalMap:
     def reset(
         self,
         env_ids,
-        maximum_terrain_index: int | None = None,
-        minimum_terrain_index: int | None = None,
-        preferred_terrain_index: int | None = None,
-        preferred_probability: float = 0.0,
-        challenge_probability: float = 0.0,
-        challenge_level_span: int = 1,
-        preferred_difficulty=1.0,
+        terrain_probabilities=None,
+        terrain_difficulty=1.0,
+        domain_randomization_scale=0.0,
     ) -> None:
         import torch
 
-        if (
-            not 0.0 <= preferred_probability <= 1.0
-            or not 0.0 <= challenge_probability <= 1.0
-            or preferred_probability + challenge_probability > 1.0
-        ):
-            raise ValueError("课程采样概率无效")
-        if challenge_level_span <= 0:
-            raise ValueError("challenge_level_span必须为正整数")
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         count = env_ids.numel()
-        preferred_difficulty = torch.as_tensor(
-            preferred_difficulty, dtype=torch.float32, device=self.device
+        selected_difficulty = torch.as_tensor(
+            terrain_difficulty, dtype=torch.float32, device=self.device
         )
-        if preferred_difficulty.ndim == 0:
-            preferred_difficulty = preferred_difficulty.expand(count)
+        randomization_scale = torch.as_tensor(
+            domain_randomization_scale, dtype=torch.float32, device=self.device
+        )
+        if selected_difficulty.ndim == 0:
+            selected_difficulty = selected_difficulty.expand(count)
+        if randomization_scale.ndim == 0:
+            randomization_scale = randomization_scale.expand(count)
         if (
-            preferred_difficulty.shape != (count,)
-            or torch.any((preferred_difficulty < 0.0) | (preferred_difficulty > 1.0))
+            selected_difficulty.shape != (count,)
+            or randomization_scale.shape != (count,)
+            or torch.any(
+                (selected_difficulty < 0.0) | (selected_difficulty > 1.0)
+            )
+            or torch.any(
+                (randomization_scale < 0.0) | (randomization_scale > 1.0)
+            )
         ):
-            raise ValueError("preferred_difficulty必须是[0,1]内的标量或逐环境张量")
-        maximum_index = (
-            torch.full((count,), len(TERRAIN_NAMES) - 1, dtype=torch.long, device=self.device)
-            if maximum_terrain_index is None
-            else torch.as_tensor(maximum_terrain_index, dtype=torch.long, device=self.device)
-        )
-        if maximum_index.ndim == 0:
-            maximum_index = maximum_index.expand(count)
-        if maximum_index.shape != (count,):
-            raise ValueError("maximum_terrain_index必须是标量或与env_ids等长的张量")
-        maximum_index = maximum_index.clamp(0, len(TERRAIN_NAMES) - 1)
-        minimum_index = (
-            torch.zeros(count, dtype=torch.long, device=self.device)
-            if minimum_terrain_index is None
-            else torch.as_tensor(
-                minimum_terrain_index, dtype=torch.long, device=self.device
+            raise ValueError("地形难度与域随机化强度必须位于[0,1]")
+        if terrain_probabilities is None:
+            sampling_weights = torch.zeros(
+                (count, len(TERRAIN_NAMES)), device=self.device
             )
-        )
-        if minimum_index.ndim == 0:
-            minimum_index = minimum_index.expand(count)
-        if minimum_index.shape != (count,):
-            raise ValueError("minimum_terrain_index必须是标量或与env_ids等长的张量")
-        minimum_index = minimum_index.clamp(0, len(TERRAIN_NAMES) - 1)
-        if torch.any(minimum_index > maximum_index):
-            raise ValueError("minimum_terrain_index不能大于maximum_terrain_index")
-        eligible = (
-            (self.enabled_terrain_indices[None, :] >= minimum_index[:, None])
-            & (self.enabled_terrain_indices[None, :] <= maximum_index[:, None])
-        )
-        no_candidate = ~eligible.any(dim=1)
-        if no_candidate.any():
-            raise ValueError("指定地形等级范围内没有启用的地形")
-        sampling_weights = eligible.float()
-        preferred_index = None
-        challenge_sample = torch.zeros(count, dtype=torch.bool, device=self.device)
-        if preferred_terrain_index is not None:
-            preferred_index = torch.as_tensor(
-                preferred_terrain_index, dtype=torch.long, device=self.device
+            sampling_weights[:, self.enabled_terrain_indices] = 1.0
+        else:
+            sampling_weights = torch.as_tensor(
+                terrain_probabilities, dtype=torch.float32, device=self.device
             )
-            if preferred_index.ndim == 0:
-                preferred_index = preferred_index.expand(count)
-            if preferred_index.shape != (count,):
-                raise ValueError("preferred_terrain_index必须是标量或与env_ids等长的张量")
-            preferred_slots = (
-                self.enabled_terrain_indices[None, :] == preferred_index[:, None]
-            ) & eligible
-            has_preferred = preferred_slots.any(dim=1)
-            replay_slots = eligible & (
-                self.enabled_terrain_indices[None, :] < preferred_index[:, None]
-            )
-            challenge_slots = (
-                eligible
-                & (
-                    self.enabled_terrain_indices[None, :]
-                    > preferred_index[:, None]
+            if sampling_weights.shape != (count, len(TERRAIN_NAMES)):
+                raise ValueError(
+                    "terrain_probabilities必须为[B, terrain_count]"
                 )
-                & (
-                    self.enabled_terrain_indices[None, :]
-                    <= preferred_index[:, None] + challenge_level_span
-                )
+            enabled_mask = torch.zeros(
+                len(TERRAIN_NAMES), dtype=torch.bool, device=self.device
             )
-            replay_count = replay_slots.sum(dim=1)
-            challenge_count = challenge_slots.sum(dim=1)
-            replay_mass = torch.full(
-                (count,),
-                1.0 - preferred_probability - challenge_probability,
-                device=self.device,
-            )
-            challenge_mass = torch.full(
-                (count,), challenge_probability, device=self.device
-            )
-            frontier_mass = torch.full(
-                (count,), preferred_probability, device=self.device
-            )
-            frontier_mass += torch.where(
-                replay_count == 0, replay_mass, torch.zeros_like(replay_mass)
-            )
-            frontier_mass += torch.where(
-                challenge_count == 0,
-                challenge_mass,
-                torch.zeros_like(challenge_mass),
-            )
-            replay_per_slot = torch.where(
-                replay_count > 0,
-                replay_mass / replay_count.clamp(min=1),
-                torch.zeros_like(replay_mass),
-            )
-            challenge_per_slot = torch.where(
-                challenge_count > 0,
-                challenge_mass / challenge_count.clamp(min=1),
-                torch.zeros_like(challenge_mass),
-            )
-            weighted = (
-                replay_slots.float() * replay_per_slot[:, None]
-                + challenge_slots.float() * challenge_per_slot[:, None]
-                + preferred_slots.float() * frontier_mass[:, None]
-            )
+            enabled_mask[self.enabled_terrain_indices] = True
             sampling_weights = torch.where(
-                has_preferred[:, None], weighted, sampling_weights
+                enabled_mask[None, :],
+                sampling_weights,
+                torch.zeros_like(sampling_weights),
             )
-        selected_slots = torch.multinomial(sampling_weights, 1).squeeze(1)
-        selected = self.enabled_terrain_indices[selected_slots]
-        selected_difficulty = torch.ones(count, device=self.device)
-        if preferred_index is not None:
-            challenge_sample = selected > preferred_index
-            selected_difficulty = torch.where(
-                selected == preferred_index,
-                preferred_difficulty,
-                selected_difficulty,
-            )
-            # 未来等级挑战只承担预适应作用，从该类地形的最易几何开始。
-            selected_difficulty = torch.where(
-                challenge_sample,
-                torch.zeros_like(selected_difficulty),
-                selected_difficulty,
-            )
+        if (
+            not torch.isfinite(sampling_weights).all()
+            or torch.any(sampling_weights < 0.0)
+            or torch.any(sampling_weights.sum(dim=1) <= 0.0)
+        ):
+            raise ValueError("地形采样权重无效或指向未启用地形")
+        selected = torch.multinomial(sampling_weights, 1).squeeze(1)
         self.terrain_type[env_ids] = selected
         self.terrain_difficulty[env_ids] = selected_difficulty
+        self.domain_randomization_scale[env_ids] = randomization_scale
+        stair_index = TERRAIN_NAMES.index("stairs")
+        stair_descent = (selected == stair_index) & (
+            torch.rand(count, device=self.device) < 0.5
+        )
+        self.traversal_direction[env_ids] = torch.where(
+            stair_descent,
+            -torch.ones(count, device=self.device),
+            torch.ones(count, device=self.device),
+        )
         unit = torch.rand(count, device=self.device)
         amplitude = torch.zeros(count, device=self.device)
 
-        def sample_range(bounds):
-            return bounds[0] + (bounds[1] - bounds[0]) * unit
+        def sample_progressive_range(bounds):
+            return bounds[0] + selected_difficulty * (bounds[1] - bounds[0]) * unit
 
-        amplitude = torch.where(selected == 1, sample_range(self.cfg.ramp_slope_range), amplitude)
         amplitude = torch.where(
-            (selected == 2) | (selected == 3) | (selected == 8) | (selected == 9),
-            sample_range(self.cfg.step_height_range_m),
+            selected == TERRAIN_NAMES.index("ramp"),
+            sample_progressive_range(self.cfg.ramp_slope_range),
             amplitude,
         )
-        amplitude = torch.where(selected == 4, sample_range(self.cfg.rough_amplitude_range_m), amplitude)
+        amplitude = torch.where(
+            (selected == TERRAIN_NAMES.index("step"))
+            | (selected == TERRAIN_NAMES.index("stairs"))
+            | (selected == TERRAIN_NAMES.index("mixed"))
+            | (selected == TERRAIN_NAMES.index("multi_route")),
+            sample_progressive_range(self.cfg.step_height_range_m),
+            amplitude,
+        )
+        amplitude = torch.where(
+            selected == TERRAIN_NAMES.index("rough"),
+            sample_progressive_range(self.cfg.rough_amplitude_range_m),
+            amplitude,
+        )
         pit_depth_minimum, pit_depth_maximum = self.cfg.pit_depth_range_m
         progressive_pit_depth_maximum = (
             self.cfg.pit_curriculum_start_depth_max_m
@@ -402,9 +398,19 @@ class SimulatedLocalMap:
         pit_depth = pit_depth_minimum + (
             progressive_pit_depth_maximum - pit_depth_minimum
         ) * torch.rand(count, device=self.device)
-        amplitude = torch.where(selected == 5, pit_depth, amplitude)
         amplitude = torch.where(
-            (selected == 6) | (selected == 7), sample_range(self.cfg.obstacle_height_range_m), amplitude
+            selected == TERRAIN_NAMES.index("pit"), pit_depth, amplitude
+        )
+        amplitude = torch.where(
+            (selected == TERRAIN_NAMES.index("wall"))
+            | (selected == TERRAIN_NAMES.index("pillar")),
+            sample_progressive_range(self.cfg.obstacle_height_range_m),
+            amplitude,
+        )
+        amplitude = torch.where(
+            selected == TERRAIN_NAMES.index("low_obstacle"),
+            sample_progressive_range(self.cfg.low_obstacle_height_range_m),
+            amplitude,
         )
         self.amplitude[env_ids] = amplitude
         route_yaw = -torch.pi + 2.0 * torch.pi * torch.rand(count, device=self.device)
@@ -430,7 +436,7 @@ class SimulatedLocalMap:
             progressive_pit_width_maximum - pit_width_minimum
         ) * torch.rand(count, device=self.device)
         self.feature_width[env_ids] = torch.where(
-            selected == 5, pit_width, feature_width
+            selected == TERRAIN_NAMES.index("pit"), pit_width, feature_width
         )
         barrier_min, barrier_max = self.cfg.barrier_half_width_range_m
         barrier_width = barrier_min + (
@@ -442,7 +448,9 @@ class SimulatedLocalMap:
             * (1.0 - self.cfg.challenge_barrier_width_scale)
         )
         uses_barrier_width = (
-            (selected == 6) | (selected == 8) | (selected == 9)
+            (selected == TERRAIN_NAMES.index("wall"))
+            | (selected == TERRAIN_NAMES.index("mixed"))
+            | (selected == TERRAIN_NAMES.index("multi_route"))
         )
         barrier_width = torch.where(
             uses_barrier_width,
@@ -451,11 +459,15 @@ class SimulatedLocalMap:
         )
         self.barrier_half_width[env_ids] = barrier_width
         friction_min, friction_max = self.cfg.friction_range
-        self.friction[env_ids] = friction_min + (friction_max - friction_min) * torch.rand(
-            count, device=self.device
+        randomized_friction = friction_min + (
+            friction_max - friction_min
+        ) * torch.rand(count, device=self.device)
+        self.friction[env_ids] = 1.0 + randomization_scale * (
+            randomized_friction - 1.0
         )
         self.occlusion_enabled[env_ids] = (
-            torch.rand(count, device=self.device) < self.cfg.occlusion_sector_probability
+            torch.rand(count, device=self.device)
+            < self.cfg.occlusion_sector_probability * randomization_scale
         )
         self.occlusion_angle[env_ids] = -torch.pi + 2.0 * torch.pi * torch.rand(
             count, device=self.device
@@ -543,14 +555,68 @@ class SimulatedLocalMap:
         self.feature_yaw[env_ids] = route_yaw
         return goals
 
-    def navigation_potential(self, pose, goal_xy, env_ids=None):
-        """Return obstacle-aware remaining path length for reward shaping.
+    @staticmethod
+    def _segment_intersects_rectangle(
+        start_along,
+        start_cross,
+        end_along,
+        end_cross,
+        minimum_along,
+        maximum_along,
+        minimum_cross,
+        maximum_cross,
+    ):
+        """Vectorized line-segment/AABB intersection in obstacle coordinates."""
+        import torch
 
-        For a finite wall separating robot and goal, Euclidean distance points
-        directly through the obstacle. The potential instead uses the shorter
-        of the two collision-free routes around the wall endpoints. It falls
-        back to Euclidean distance once the straight segment is no longer
-        blocked and for every other terrain type.
+        def slab(start, delta, minimum, maximum):
+            parallel = delta.abs() <= 1.0e-6
+            safe_delta = torch.where(parallel, torch.ones_like(delta), delta)
+            first = (minimum - start) / safe_delta
+            second = (maximum - start) / safe_delta
+            enter = torch.minimum(first, second)
+            leave = torch.maximum(first, second)
+            inside = (start >= minimum) & (start <= maximum)
+            positive_infinity = torch.full_like(start, torch.inf)
+            negative_infinity = torch.full_like(start, -torch.inf)
+            enter = torch.where(
+                parallel,
+                torch.where(inside, negative_infinity, positive_infinity),
+                enter,
+            )
+            leave = torch.where(
+                parallel,
+                torch.where(inside, positive_infinity, negative_infinity),
+                leave,
+            )
+            return enter, leave
+
+        delta_along = end_along - start_along
+        delta_cross = end_cross - start_cross
+        along_enter, along_leave = slab(
+            start_along, delta_along, minimum_along, maximum_along
+        )
+        cross_enter, cross_leave = slab(
+            start_cross, delta_cross, minimum_cross, maximum_cross
+        )
+        enter = torch.maximum(
+            torch.maximum(along_enter, cross_enter),
+            torch.zeros_like(start_along),
+        )
+        leave = torch.minimum(
+            torch.minimum(along_leave, cross_leave),
+            torch.ones_like(start_along),
+        )
+        return enter <= leave
+
+    def navigation_guidance(self, pose, goal_xy, env_ids=None) -> NavigationGuidance:
+        """Return collision-free reward potential and its immediate target.
+
+        Hazardous pits, walls, pillars, mixed-scene walls, and multi-route
+        barriers are approximated by clearance-expanded rectangles. If the
+        direct goal segment intersects the active rectangle, the shorter path
+        around its two lateral sides supplies both the shaping potential and
+        the direction used by heading rewards.
         """
         import torch
 
@@ -560,13 +626,16 @@ class SimulatedLocalMap:
             raise ValueError("goal_xy形状必须为[B,2]")
         env_ids = self._environment_indices(pose.shape[0], env_ids)
         direct = torch.linalg.vector_norm(goal_xy - pose[:, :2], dim=-1)
+        terrain = self.terrain_type[env_ids]
+        width = self.feature_width[env_ids]
+        barrier_width = self.barrier_half_width[env_ids]
+        clearance = float(self.cfg.barrier_navigation_clearance_m)
 
         feature_x = self.feature_x[env_ids]
         feature_y = self.feature_y[env_ids]
         feature_yaw = self.feature_yaw[env_ids]
         cosine = torch.cos(feature_yaw)
         sine = torch.sin(feature_yaw)
-
         robot_dx = pose[:, 0] - feature_x
         robot_dy = pose[:, 1] - feature_y
         goal_dx = goal_xy[:, 0] - feature_x
@@ -576,52 +645,131 @@ class SimulatedLocalMap:
         goal_along = cosine * goal_dx + sine * goal_dy
         goal_cross = -sine * goal_dx + cosine * goal_dy
 
-        denominator = goal_along - robot_along
-        safe_denominator = torch.where(
-            denominator.abs() > 1.0e-6,
-            denominator,
-            torch.ones_like(denominator),
+        zeros = torch.zeros_like(direct)
+        minimum_along = zeros.clone()
+        maximum_along = zeros.clone()
+        minimum_cross = zeros.clone()
+        maximum_cross = zeros.clone()
+        active = torch.zeros_like(terrain, dtype=torch.bool)
+
+        pit = (terrain == 5) & (
+            self.amplitude[env_ids] >= self.cfg.pit_navigation_avoidance_depth_m
         )
-        intersection_fraction = -robot_along / safe_denominator
-        intersection_cross = robot_cross + intersection_fraction * (
-            goal_cross - robot_cross
+        pit_along_half = width + clearance
+        pit_cross_half = 1.2 * width + clearance
+        minimum_along = torch.where(pit, -pit_along_half, minimum_along)
+        maximum_along = torch.where(pit, pit_along_half, maximum_along)
+        minimum_cross = torch.where(pit, -pit_cross_half, minimum_cross)
+        maximum_cross = torch.where(pit, pit_cross_half, maximum_cross)
+        active |= pit
+
+        wall_like = (terrain == 6) | (terrain == 9)
+        wall_along_half = torch.full_like(direct, 0.10 + clearance)
+        wall_cross_half = barrier_width + clearance
+        minimum_along = torch.where(wall_like, -wall_along_half, minimum_along)
+        maximum_along = torch.where(wall_like, wall_along_half, maximum_along)
+        minimum_cross = torch.where(wall_like, -wall_cross_half, minimum_cross)
+        maximum_cross = torch.where(wall_like, wall_cross_half, maximum_cross)
+        active |= wall_like
+
+        pillar = terrain == 7
+        pillar_half = width + clearance
+        minimum_along = torch.where(pillar, -pillar_half, minimum_along)
+        maximum_along = torch.where(pillar, pillar_half, maximum_along)
+        minimum_cross = torch.where(pillar, -pillar_half, minimum_cross)
+        maximum_cross = torch.where(pillar, pillar_half, maximum_cross)
+        active |= pillar
+
+        mixed = terrain == 8
+        mixed_along_half = torch.full_like(direct, 0.12 + clearance)
+        minimum_along = torch.where(
+            mixed, 0.8 - mixed_along_half, minimum_along
         )
-        endpoint_cross = (
-            self.barrier_half_width[env_ids]
-            + self.cfg.barrier_navigation_clearance_m
+        maximum_along = torch.where(
+            mixed, 0.8 + mixed_along_half, maximum_along
         )
-        crosses_wall_plane = (
-            (denominator.abs() > 1.0e-6)
-            & (intersection_fraction > 0.0)
-            & (intersection_fraction < 1.0)
+        minimum_cross = torch.where(
+            mixed, torch.full_like(direct, -clearance), minimum_cross
         )
-        blocked = (
-            (self.terrain_type[env_ids] == 6)
-            & crosses_wall_plane
-            & (intersection_cross.abs() < endpoint_cross)
+        maximum_cross = torch.where(
+            mixed, barrier_width + clearance, maximum_cross
+        )
+        active |= mixed
+
+        blocked = active & self._segment_intersects_rectangle(
+            robot_along,
+            robot_cross,
+            goal_along,
+            goal_cross,
+            minimum_along,
+            maximum_along,
+            minimum_cross,
+            maximum_cross,
+        )
+        forward = goal_along >= robot_along
+        entry_along = torch.where(forward, minimum_along, maximum_along)
+        exit_along = torch.where(forward, maximum_along, minimum_along)
+        edge_length = (exit_along - entry_along).abs()
+        upper_path = (
+            torch.hypot(robot_along - entry_along, robot_cross - maximum_cross)
+            + edge_length
+            + torch.hypot(goal_along - exit_along, goal_cross - maximum_cross)
+        )
+        lower_path = (
+            torch.hypot(robot_along - entry_along, robot_cross - minimum_cross)
+            + edge_length
+            + torch.hypot(goal_along - exit_along, goal_cross - minimum_cross)
+        )
+        use_upper = upper_path <= lower_path
+        target_cross = torch.where(use_upper, maximum_cross, minimum_cross)
+        at_selected_side = torch.where(
+            use_upper,
+            robot_cross >= maximum_cross - 1.0e-4,
+            robot_cross <= minimum_cross + 1.0e-4,
+        )
+        past_entry = torch.where(
+            forward,
+            robot_along >= entry_along - 1.0e-4,
+            robot_along <= entry_along + 1.0e-4,
+        )
+        use_exit_target = at_selected_side & past_entry
+        target_along = torch.where(
+            use_exit_target, exit_along, entry_along
+        )
+        cleared = at_selected_side & torch.where(
+            forward,
+            robot_along >= exit_along - 1.0e-4,
+            robot_along <= exit_along + 1.0e-4,
+        )
+        blocked &= ~cleared
+        target_world = torch.stack(
+            (
+                feature_x + cosine * target_along - sine * target_cross,
+                feature_y + sine * target_along + cosine * target_cross,
+            ),
+            dim=-1,
+        )
+        full_detour = torch.where(use_upper, upper_path, lower_path)
+        exit_detour = (
+            torch.hypot(
+                robot_along - exit_along,
+                robot_cross - target_cross,
+            )
+            + torch.hypot(
+                goal_along - exit_along,
+                goal_cross - target_cross,
+            )
+        )
+        detour = torch.where(use_exit_target, exit_detour, full_detour)
+        return NavigationGuidance(
+            potential_m=torch.where(blocked, detour, direct),
+            target_xy=torch.where(blocked[:, None], target_world, goal_xy),
+            blocked=blocked,
         )
 
-        upper_robot = torch.sqrt(
-            robot_along.square()
-            + (robot_cross - endpoint_cross).square()
-        )
-        upper_goal = torch.sqrt(
-            goal_along.square()
-            + (goal_cross - endpoint_cross).square()
-        )
-        lower_robot = torch.sqrt(
-            robot_along.square()
-            + (robot_cross + endpoint_cross).square()
-        )
-        lower_goal = torch.sqrt(
-            goal_along.square()
-            + (goal_cross + endpoint_cross).square()
-        )
-        detour = torch.minimum(
-            upper_robot + upper_goal,
-            lower_robot + lower_goal,
-        )
-        return torch.where(blocked, detour, direct)
+    def navigation_potential(self, pose, goal_xy, env_ids=None):
+        """Return the obstacle-aware remaining path length."""
+        return self.navigation_guidance(pose, goal_xy, env_ids).potential_m
 
     def _environment_indices(self, batch_size: int, env_ids=None):
         import torch
@@ -666,6 +814,9 @@ class SimulatedLocalMap:
         barrier_half_width = self._expanded(
             self.barrier_half_width, dimensions, env_ids
         )
+        traversal_direction = self._expanded(
+            self.traversal_direction, dimensions, env_ids
+        )
         delta_x = world_x - feature_x
         delta_y = world_y - feature_y
         along = torch.cos(feature_yaw) * delta_x + torch.sin(feature_yaw) * delta_y
@@ -681,7 +832,11 @@ class SimulatedLocalMap:
         ground = torch.where(step & (along > 0.0), amplitude, ground)
 
         stairs = terrain == 3
-        stair_count = torch.clamp(torch.floor(along / width) + 1.0, 0.0, 4.0)
+        stair_count = torch.clamp(
+            torch.floor(traversal_direction * along / width) + 1.0,
+            0.0,
+            4.0,
+        )
         ground = torch.where(stairs, stair_count * amplitude * 0.45, ground)
 
         rough = terrain == 4
@@ -704,6 +859,10 @@ class SimulatedLocalMap:
         obstacle_range = torch.where(pillar & pillar_cells, amplitude, obstacle_range)
 
         mixed = terrain == 8
+        mixed_ramp = 0.30 * amplitude * torch.clamp(
+            along + 0.75, min=0.0, max=1.5
+        )
+        ground = torch.where(mixed, mixed_ramp, ground)
         mixed_step = mixed & (along > 0.0) & (cross < 0.0)
         mixed_wall = (
             mixed
@@ -711,7 +870,7 @@ class SimulatedLocalMap:
             & (cross > 0.0)
             & (cross < barrier_half_width)
         )
-        ground = torch.where(mixed_step, amplitude, ground)
+        ground = torch.where(mixed_step, mixed_ramp + amplitude, ground)
         obstacle_range = torch.where(mixed_wall, 0.8 + amplitude, obstacle_range)
 
         multi_route = terrain == 9
@@ -719,6 +878,16 @@ class SimulatedLocalMap:
             torch.abs(cross) < barrier_half_width
         )
         obstacle_range = torch.where(multi_route & low_barrier, amplitude, obstacle_range)
+
+        low_obstacle = terrain == 10
+        low_obstacle_cells = (torch.abs(along) < width) & (
+            torch.abs(cross) < 0.6 * width
+        )
+        obstacle_range = torch.where(
+            low_obstacle & low_obstacle_cells,
+            amplitude,
+            obstacle_range,
+        )
         return ground, obstacle_range
 
     def _height_and_obstacle_range(self, world_x, world_y, grid_yaw=None, env_ids=None):
@@ -842,13 +1011,26 @@ class SimulatedLocalMap:
                 return_ground_reference=return_ground_reference,
             )
         batch_size = env_ids.numel()
+        randomization_scale = self.domain_randomization_scale[env_ids]
         noisy_pose = pose.clone()
-        noisy_pose[:, :2] += self.cfg.pose_xy_noise_std_m * torch.randn_like(noisy_pose[:, :2])
-        noisy_pose[:, 2] += self.cfg.pose_yaw_noise_std_rad * torch.randn_like(noisy_pose[:, 2])
+        noisy_pose[:, :2] += (
+            self.cfg.pose_xy_noise_std_m
+            * randomization_scale[:, None]
+            * torch.randn_like(noisy_pose[:, :2])
+        )
+        noisy_pose[:, 2] += (
+            self.cfg.pose_yaw_noise_std_rad
+            * randomization_scale
+            * torch.randn_like(noisy_pose[:, 2])
+        )
         if velocity is not None:
             if velocity.shape != (batch_size, 2):
                 raise ValueError("velocity形状必须为[B,2]")
-            time_offset = self.cfg.time_jitter_std_s * torch.randn_like(noisy_pose[:, 0])
+            time_offset = (
+                self.cfg.time_jitter_std_s
+                * randomization_scale
+                * torch.randn_like(noisy_pose[:, 0])
+            )
             noisy_pose[:, 0] += velocity[:, 0] * torch.cos(noisy_pose[:, 2]) * time_offset
             noisy_pose[:, 1] += velocity[:, 0] * torch.sin(noisy_pose[:, 2]) * time_offset
             noisy_pose[:, 2] += velocity[:, 1] * time_offset
@@ -866,10 +1048,16 @@ class SimulatedLocalMap:
         measured_ground = (
             ground
             - ground_reference_z[:, None, None]
-            + self.cfg.height_noise_std_m * torch.randn_like(ground)
+            + self.cfg.height_noise_std_m
+            * randomization_scale[:, None, None]
+            * torch.randn_like(ground)
         )
         height_range = torch.clamp(
-            height_range + self.cfg.range_noise_std_m * torch.randn_like(height_range), min=0.0
+            height_range
+            + self.cfg.range_noise_std_m
+            * randomization_scale[:, None, None]
+            * torch.randn_like(height_range),
+            min=0.0,
         )
 
         coarse_size = max(2, self.cfg.size // 8)
@@ -881,7 +1069,13 @@ class SimulatedLocalMap:
         observation_sample = functional.interpolate(
             coarse_observation, size=ground.shape[-2:], mode="nearest"
         )[:, 0]
-        unknown = observation_sample < self.cfg.missing_probability
+        missing_probability = (
+            self.cfg.missing_probability * randomization_scale[:, None, None]
+        )
+        ray_only_probability = (
+            self.cfg.ray_only_probability * randomization_scale[:, None, None]
+        )
+        unknown = observation_sample < missing_probability
         angle_delta = torch.atan2(
             torch.sin(self.local_angle - self.occlusion_angle[env_ids, None, None]),
             torch.cos(self.local_angle - self.occlusion_angle[env_ids, None, None]),
@@ -893,10 +1087,10 @@ class SimulatedLocalMap:
         )
         unknown |= occluded
         ray_only = (
-            observation_sample >= self.cfg.missing_probability
+            observation_sample >= missing_probability
         ) & (
             observation_sample
-            < self.cfg.missing_probability + self.cfg.ray_only_probability
+            < missing_probability + ray_only_probability
         ) & ~unknown
         valid = ~(unknown | ray_only)
         observed = valid | ray_only

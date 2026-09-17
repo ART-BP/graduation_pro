@@ -6,6 +6,10 @@ from go2w_terrain_planner.mapping.simulated_local_map import (
     SimulatedLocalMap,
     SimulatedMapConfig,
 )
+from go2w_terrain_planner.mapping.simulated_pointcloud_projector import (
+    PointCloudProjectionConfig,
+    SimulatedPointCloudProjector,
+)
 from go2w_terrain_planner.mapping.simulated_xt16_lidar import (
     SimulatedXt16Lidar,
     Xt16LidarConfig,
@@ -39,6 +43,59 @@ def test_xt16_configuration_requires_one_angle_per_channel() -> None:
         )
 
 
+def test_xt16_configuration_requires_complete_channel_cycles() -> None:
+    with pytest.raises(ValueError, match="points_per_frame"):
+        SimulatedXt16Lidar(
+            1,
+            "cpu",
+            Xt16LidarConfig(points_per_frame=32001),
+        )
+
+
+def test_pointcloud_projection_uses_robust_height_percentiles() -> None:
+    projector = SimulatedPointCloudProjector(
+        PointCloudProjectionConfig(
+            body_height_m=0.35,
+            vertical_min_offset_m=-1.5,
+            vertical_max_offset_m=1.5,
+            ground_percentile=0.10,
+            span_lower_percentile=0.05,
+            span_upper_percentile=0.80,
+        )
+    )
+    heights = torch.tensor(
+        [0.00, 0.01, 0.01, 0.02, 0.02, 0.02, 0.03, 0.03, 0.04, 1.20]
+    )
+    points = torch.stack(
+        (
+            torch.full_like(heights, 0.025),
+            torch.full_like(heights, 0.025),
+            heights,
+        ),
+        dim=-1,
+    )[None]
+    observed = torch.zeros((1, 4, 4))
+    observed[:, 2, 2] = 1.0
+
+    result = projector.project(
+        points,
+        observed,
+        extent_m=0.2,
+        size=4,
+        maximum_relative_height_m=1.0,
+        maximum_height_range_m=2.0,
+        ground_fill_value=0.0,
+        range_fill_value=0.0,
+        normalize_heights=False,
+    )
+
+    assert result[0, 0, 2, 2].item() == pytest.approx(0.0)
+    assert result[0, 1, 2, 2].item() < 0.1
+    assert result[0, 2, 2, 2].item() == 1.0
+    assert result[0, 3, 2, 2].item() == 1.0
+    assert projector.last_point_count[0, 2, 2].item() == 10
+
+
 def test_raycast_flat_map_comes_from_sparse_returns_and_traversed_cells() -> None:
     cfg = SimulatedMapConfig(
         size=40,
@@ -62,7 +119,7 @@ def test_raycast_flat_map_comes_from_sparse_returns_and_traversed_cells() -> Non
     valid_ground = result[:, 0][result[:, 3] > 0.5]
     assert torch.allclose(valid_ground, torch.zeros_like(valid_ground), atol=1.0e-5)
     assert generator.lidar_sensor is not None
-    assert generator.lidar_sensor.last_pointcloud.shape[0] == 2
+    assert generator.lidar_sensor.last_pointcloud.shape == (2, 32000, 3)
     assert torch.all(generator.lidar_sensor.last_hit_mask.sum(dim=1) > 0)
 
 

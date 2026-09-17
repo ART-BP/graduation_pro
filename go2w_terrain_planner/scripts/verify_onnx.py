@@ -14,6 +14,9 @@ import numpy as np
 import onnxruntime as ort
 
 from go2w_terrain_planner.utils.config_loader import load_project_config
+from go2w_terrain_planner.utils.observation_layout import (
+    policy_observation_dimension,
+)
 
 
 def main() -> None:
@@ -26,14 +29,11 @@ def main() -> None:
     map_config = config["map"]
     history_config = config["history"]
     map_size = args.map_size if args.map_size is not None else int(map_config["output_size"])
-    policy_dim = (
-        int(map_config["history_length"])
-        * int(map_config["channels"])
-        * map_size
-        * map_size
-        + 3
-        + int(history_config["command_length"]) * 2
-        + int(history_config["motion_length"]) * 3
+    policy_dim = policy_observation_dimension(
+        map_channels=int(map_config["actor_channels"]),
+        map_size=map_size,
+        command_history_length=int(history_config["command_length"]),
+        motion_history_length=int(history_config["motion_length"]),
     )
     session = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
     inputs = session.get_inputs()
@@ -42,10 +42,8 @@ def main() -> None:
         raise RuntimeError(f"ONNX输入名称错误：{[item.name for item in inputs]}")
     if [item.name for item in outputs] != ["velocity_command"]:
         raise RuntimeError(f"ONNX输出名称错误：{[item.name for item in outputs]}")
-    observation = np.zeros((2, policy_dim), dtype=np.float32)
     # Use the feature dimension declared by the exported ONNX model.
-    # This avoids duplicating and accidentally desynchronizing the
-    # policy-observation dimension calculation.
+    # It must exactly match the dimension derived from the selected config.
     input_meta = session.get_inputs()[0]
     input_shape = input_meta.shape
 
@@ -60,9 +58,14 @@ def main() -> None:
         raise RuntimeError(
             f"ONNX特征维度不是固定正整数: {feature_dim}"
         )
+    if feature_dim != policy_dim:
+        raise RuntimeError(
+            "ONNX输入维度与项目配置不一致："
+            f"model={feature_dim}, config={policy_dim}"
+        )
 
     observation = np.zeros(
-        (observation.shape[0], feature_dim),
+        (2, policy_dim),
         dtype=np.float32,
     )
 

@@ -5,8 +5,16 @@ torch = pytest.importorskip("torch")
 from go2w_terrain_planner.mapping.simulated_local_map import (
     SimulatedLocalMap,
     SimulatedMapConfig,
+    TERRAIN_NAMES,
     fuse_aligned_map_history,
 )
+
+
+def terrain_probabilities(count: int, **weights: float):
+    result = torch.zeros((count, len(TERRAIN_NAMES)))
+    for name, weight in weights.items():
+        result[:, TERRAIN_NAMES.index(name)] = weight
+    return result
 
 
 def test_simulated_map_contract() -> None:
@@ -45,7 +53,7 @@ def test_task_goal_places_feature_between_start_and_goal() -> None:
         SimulatedMapConfig(size=24, enabled_terrain_names=("step",)),
     )
     ids = torch.arange(8)
-    generator.reset(ids, torch.full((8,), 2))
+    generator.reset(ids)
     pose = torch.zeros((8, 3))
 
     goal = generator.sample_task_goals(pose, 2.0, 4.0, ids)
@@ -62,22 +70,22 @@ def test_task_goal_places_feature_between_start_and_goal() -> None:
     assert torch.all(feature_cross <= 0.081)
 
 
-def test_reset_respects_terrain_sampling_range() -> None:
+def test_reset_respects_explicit_terrain_probabilities() -> None:
     generator = SimulatedLocalMap(256, "cpu", SimulatedMapConfig(size=12))
     env_ids = torch.arange(256)
 
     generator.reset(
         env_ids,
-        maximum_terrain_index=6,
-        minimum_terrain_index=2,
+        terrain_probabilities(count=256, step=0.4, wall=0.6),
     )
 
-    assert torch.all(generator.terrain_type >= 2)
-    assert torch.all(generator.terrain_type <= 6)
-    assert not torch.any(generator.terrain_type == 0)
+    assert torch.all(
+        (generator.terrain_type == TERRAIN_NAMES.index("step"))
+        | (generator.terrain_type == TERRAIN_NAMES.index("wall"))
+    )
 
 
-def test_reset_focuses_on_curriculum_frontier_without_forgetting() -> None:
+def test_reset_matches_requested_terrain_mixture() -> None:
     torch.manual_seed(7)
     count = 4000
     generator = SimulatedLocalMap(count, "cpu", SimulatedMapConfig(size=12))
@@ -85,41 +93,30 @@ def test_reset_focuses_on_curriculum_frontier_without_forgetting() -> None:
 
     generator.reset(
         env_ids,
-        maximum_terrain_index=5,
-        minimum_terrain_index=0,
-        preferred_terrain_index=5,
-        preferred_probability=0.65,
+        terrain_probabilities(count=count, pit=0.65, flat=0.35),
     )
 
-    frontier_ratio = (generator.terrain_type == 5).float().mean().item()
-    assert frontier_ratio == pytest.approx(0.65, abs=0.03)
-    assert torch.all(generator.terrain_type <= 5)
-    assert torch.any(generator.terrain_type < 5)
+    pit_ratio = (
+        generator.terrain_type == TERRAIN_NAMES.index("pit")
+    ).float().mean().item()
+    assert pit_ratio == pytest.approx(0.65, abs=0.03)
 
 
-def test_reset_mixes_replay_frontier_and_near_future_challenges() -> None:
+def test_reset_rejects_probability_on_disabled_terrain() -> None:
     torch.manual_seed(11)
-    count = 6000
-    generator = SimulatedLocalMap(count, "cpu", SimulatedMapConfig(size=12))
+    count = 8
+    generator = SimulatedLocalMap(
+        count,
+        "cpu",
+        SimulatedMapConfig(size=12, enabled_terrain_names=("flat",)),
+    )
     env_ids = torch.arange(count)
 
-    generator.reset(
-        env_ids,
-        maximum_terrain_index=9,
-        minimum_terrain_index=0,
-        preferred_terrain_index=5,
-        preferred_probability=0.55,
-        challenge_probability=0.15,
-        challenge_level_span=2,
-    )
-
-    terrain = generator.terrain_type
-    assert (terrain == 5).float().mean().item() == pytest.approx(0.55, abs=0.03)
-    assert (terrain < 5).float().mean().item() == pytest.approx(0.30, abs=0.03)
-    assert ((terrain == 6) | (terrain == 7)).float().mean().item() == pytest.approx(
-        0.15, abs=0.03
-    )
-    assert not torch.any(terrain > 7)
+    with pytest.raises(ValueError, match="地形采样权重"):
+        generator.reset(
+            env_ids,
+            terrain_probabilities(count=count, wall=1.0),
+        )
 
 
 def test_future_challenge_uses_narrower_barrier_geometry() -> None:
@@ -134,11 +131,8 @@ def test_future_challenge_uses_narrower_barrier_geometry() -> None:
 
     generator.reset(
         env_ids,
-        maximum_terrain_index=6,
-        preferred_terrain_index=5,
-        preferred_probability=0.0,
-        challenge_probability=1.0,
-        challenge_level_span=1,
+        terrain_probabilities(count=256, wall=1.0),
+        terrain_difficulty=0.0,
     )
 
     assert torch.all(generator.terrain_type == 6)
@@ -161,26 +155,18 @@ def test_pit_geometry_progresses_from_easy_to_full_range() -> None:
     )
     generator = SimulatedLocalMap(count, "cpu", cfg)
     env_ids = torch.arange(count)
-    preferred = torch.full((count,), 5)
-
     generator.reset(
         env_ids,
-        maximum_terrain_index=5,
-        minimum_terrain_index=5,
-        preferred_terrain_index=preferred,
-        preferred_probability=1.0,
-        preferred_difficulty=0.0,
+        terrain_probabilities(count=count, pit=1.0),
+        terrain_difficulty=0.0,
     )
     assert generator.amplitude.max().item() <= 0.120001
     assert generator.feature_width.max().item() <= 0.350001
 
     generator.reset(
         env_ids,
-        maximum_terrain_index=5,
-        minimum_terrain_index=5,
-        preferred_terrain_index=preferred,
-        preferred_probability=1.0,
-        preferred_difficulty=1.0,
+        terrain_probabilities(count=count, pit=1.0),
+        terrain_difficulty=1.0,
     )
     assert generator.amplitude.max().item() > 0.35
     assert generator.feature_width.max().item() > 0.55
@@ -197,8 +183,7 @@ def test_pit_goal_is_beyond_far_edge_with_clearance() -> None:
     env_ids = torch.arange(count)
     generator.reset(
         env_ids,
-        maximum_terrain_index=5,
-        minimum_terrain_index=5,
+        terrain_probabilities(count=count, pit=1.0),
     )
     generator.feature_width[:] = 0.6
     pose = torch.zeros((count, 3))
@@ -249,15 +234,10 @@ def test_wall_frontier_width_grows_with_intra_level_difficulty() -> None:
     )
     generator = SimulatedLocalMap(count, "cpu", cfg)
     env_ids = torch.arange(count)
-    preferred = torch.full((count,), 6)
-
     generator.reset(
         env_ids,
-        maximum_terrain_index=6,
-        minimum_terrain_index=6,
-        preferred_terrain_index=preferred,
-        preferred_probability=1.0,
-        preferred_difficulty=0.0,
+        terrain_probabilities(count=count, wall=1.0),
+        terrain_difficulty=0.0,
     )
     assert torch.allclose(
         generator.barrier_half_width,
@@ -266,16 +246,97 @@ def test_wall_frontier_width_grows_with_intra_level_difficulty() -> None:
 
     generator.reset(
         env_ids,
-        maximum_terrain_index=6,
-        minimum_terrain_index=6,
-        preferred_terrain_index=preferred,
-        preferred_probability=1.0,
-        preferred_difficulty=1.0,
+        terrain_probabilities(count=count, wall=1.0),
+        terrain_difficulty=1.0,
     )
     assert torch.allclose(
         generator.barrier_half_width,
         torch.ones_like(generator.barrier_half_width),
     )
+
+
+def test_low_obstacle_is_local_and_below_collision_height() -> None:
+    cfg = SimulatedMapConfig(
+        size=12,
+        enabled_terrain_names=("low_obstacle",),
+        low_obstacle_height_range_m=(0.15, 0.15),
+    )
+    generator = SimulatedLocalMap(1, "cpu", cfg)
+    generator.terrain_type[:] = TERRAIN_NAMES.index("low_obstacle")
+    generator.amplitude[:] = 0.15
+    generator.feature_x[:] = 0.0
+    generator.feature_y[:] = 0.0
+    generator.feature_yaw[:] = 0.0
+    generator.feature_width[:] = 0.4
+
+    _, obstacle = generator._terrain_surface(
+        torch.tensor([[[0.0, 1.0]]]),
+        torch.tensor([[[0.0, 0.0]]]),
+    )
+
+    assert obstacle[0, 0, 0].item() == pytest.approx(0.15)
+    assert obstacle[0, 0, 1].item() == pytest.approx(0.0)
+
+
+def test_mixed_terrain_contains_slope_step_and_obstacle() -> None:
+    generator = SimulatedLocalMap(1, "cpu", SimulatedMapConfig(size=12))
+    generator.terrain_type[:] = TERRAIN_NAMES.index("mixed")
+    generator.amplitude[:] = 0.2
+    generator.feature_x[:] = 0.0
+    generator.feature_y[:] = 0.0
+    generator.feature_yaw[:] = 0.0
+    generator.barrier_half_width[:] = 1.0
+    ground, obstacle = generator._terrain_surface(
+        torch.tensor([[[-0.5, 0.5, 0.8]]]),
+        torch.tensor([[[-0.5, -0.5, 0.5]]]),
+    )
+
+    assert ground[0, 0, 0] > 0.0
+    assert ground[0, 0, 1] > ground[0, 0, 0]
+    assert obstacle[0, 0, 2] > 0.0
+
+
+def test_stairs_support_upward_and_downward_traversal() -> None:
+    generator = SimulatedLocalMap(
+        2,
+        "cpu",
+        SimulatedMapConfig(size=12, enabled_terrain_names=("stairs",)),
+    )
+    generator.terrain_type[:] = TERRAIN_NAMES.index("stairs")
+    generator.amplitude[:] = 0.2
+    generator.feature_width[:] = 0.5
+    generator.feature_x[:] = 0.0
+    generator.feature_y[:] = 0.0
+    generator.feature_yaw[:] = 0.0
+    generator.traversal_direction[:] = torch.tensor([1.0, -1.0])
+    world_x = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])
+    world_y = torch.zeros_like(world_x)
+
+    ground, _ = generator._terrain_surface(world_x, world_y)
+
+    assert ground[0, 1] > ground[0, 0]
+    assert ground[1, 0] > ground[1, 1]
+
+
+def test_domain_randomization_scale_gates_friction_and_occlusion() -> None:
+    generator = SimulatedLocalMap(
+        2,
+        "cpu",
+        SimulatedMapConfig(
+            size=12,
+            enabled_terrain_names=("flat",),
+            friction_range=(0.4, 0.4),
+            occlusion_sector_probability=1.0,
+        ),
+    )
+    generator.reset(
+        torch.arange(2),
+        terrain_probabilities(2, flat=1.0),
+        domain_randomization_scale=torch.tensor([0.0, 1.0]),
+    )
+
+    assert generator.friction.tolist() == pytest.approx([1.0, 0.4])
+    assert generator.occlusion_enabled.tolist() == [False, True]
 
 
 def test_wall_navigation_potential_rewards_lateral_detour() -> None:
@@ -320,13 +381,92 @@ def test_navigation_potential_returns_to_euclidean_after_wall_is_cleared() -> No
     generator.feature_y[:] = 0.0
     generator.feature_yaw[:] = 0.0
     generator.barrier_half_width[:] = 1.0
-    pose = torch.tensor([[-1.0, 3.0, 0.0]])
+    pose = torch.tensor([[-1.0, 6.0, 0.0]])
     goal = torch.tensor([[1.0, 0.0]])
 
     potential = generator.navigation_potential(pose, goal)
     euclidean = torch.linalg.vector_norm(goal - pose[:, :2], dim=-1)
 
     assert potential.item() == pytest.approx(euclidean.item())
+
+
+@pytest.mark.parametrize("terrain_index", [5, 6, 7, 8, 9])
+def test_navigation_guidance_routes_around_non_traversable_geometry(
+    terrain_index: int,
+) -> None:
+    generator = SimulatedLocalMap(
+        1,
+        "cpu",
+        SimulatedMapConfig(size=12),
+    )
+    generator.terrain_type[:] = terrain_index
+    generator.amplitude[:] = 0.3 if terrain_index == 5 else 0.8
+    generator.feature_width[:] = 0.5
+    generator.barrier_half_width[:] = 1.0
+    generator.feature_x[:] = 0.0
+    generator.feature_y[:] = 0.0
+    generator.feature_yaw[:] = 0.0
+    pose = torch.tensor([[-2.0, 0.0, 0.0]])
+    goal = torch.tensor([[2.0, 0.0]])
+
+    guidance = generator.navigation_guidance(pose, goal)
+
+    assert guidance.blocked.item()
+    assert guidance.potential_m.item() > 4.0
+    assert abs(guidance.target_xy[0, 1].item()) >= 0.349
+
+
+def test_shallow_pit_remains_directly_traversable() -> None:
+    generator = SimulatedLocalMap(
+        1,
+        "cpu",
+        SimulatedMapConfig(
+            size=12,
+            pit_navigation_avoidance_depth_m=0.18,
+        ),
+    )
+    generator.terrain_type[:] = 5
+    generator.amplitude[:] = 0.12
+    generator.feature_width[:] = 0.5
+    generator.feature_x[:] = 0.0
+    generator.feature_y[:] = 0.0
+    generator.feature_yaw[:] = 0.0
+    pose = torch.tensor([[-2.0, 0.0, 0.0]])
+    goal = torch.tensor([[2.0, 0.0]])
+
+    guidance = generator.navigation_guidance(pose, goal)
+
+    assert not guidance.blocked.item()
+    assert guidance.potential_m.item() == pytest.approx(4.0)
+    assert torch.equal(guidance.target_xy, goal)
+
+
+def test_navigation_guidance_switches_from_entry_to_exit_corner() -> None:
+    generator = SimulatedLocalMap(
+        1,
+        "cpu",
+        SimulatedMapConfig(
+            size=12,
+            barrier_navigation_clearance_m=0.35,
+        ),
+    )
+    generator.terrain_type[:] = 6
+    generator.barrier_half_width[:] = 1.0
+    generator.feature_x[:] = 0.0
+    generator.feature_y[:] = 0.0
+    generator.feature_yaw[:] = 0.0
+    goal = torch.tensor([[2.0, 0.0]])
+
+    entry_guidance = generator.navigation_guidance(
+        torch.tensor([[-2.0, 0.0, 0.0]]), goal
+    )
+    side_guidance = generator.navigation_guidance(
+        torch.tensor([[-0.40, 1.35, 0.0]]), goal
+    )
+
+    assert entry_guidance.target_xy[0, 0].item() < 0.0
+    assert side_guidance.target_xy[0, 0].item() > 0.0
+    assert side_guidance.potential_m < entry_guidance.potential_m
 
 
 def test_truth_query_is_independent_from_actor_observation() -> None:
@@ -456,6 +596,21 @@ def test_fusion_rejects_single_frame_height_range_outlier() -> None:
 
     assert fused[0, 0, 0, 0].item() == pytest.approx(0.1)
     assert fused[0, 1, 0, 0].item() == pytest.approx(0.05)
+
+
+def test_fusion_selects_densest_consistent_ground_cluster() -> None:
+    history = torch.zeros((1, 5, 4, 1, 1))
+    history[:, :, 2:] = 1.0
+    history[0, :, 0, 0, 0] = torch.tensor([0.00, 0.01, 0.02, 0.40, 0.41])
+    history[0, :, 1, 0, 0] = torch.tensor([0.02, 0.03, 0.04, 0.30, 0.35])
+
+    fused = fuse_aligned_map_history(
+        history,
+        maximum_ground_deviation=0.05,
+    )
+
+    assert fused[0, 0, 0, 0].item() == pytest.approx(0.01)
+    assert fused[0, 1, 0, 0].item() == pytest.approx(0.04)
 
 
 def test_fusion_retains_height_observed_more_than_ten_updates_ago() -> None:

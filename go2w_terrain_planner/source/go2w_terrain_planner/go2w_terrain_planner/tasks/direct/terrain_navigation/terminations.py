@@ -13,6 +13,7 @@ def effective_terrain_entry_alignment(raw_alignment, terrain_type):
         (terrain_type == 2)
         | (terrain_type == 3)
         | (terrain_type == 8)
+        | (terrain_type == 10)
     )
     return torch.where(
         alignment_sensitive,

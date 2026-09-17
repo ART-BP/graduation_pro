@@ -14,6 +14,11 @@ from dataclasses import dataclass
 
 from go2w_terrain_planner.utils.tensor_checks import require_finite
 
+from .simulated_pointcloud_projector import (
+    PointCloudProjectionConfig,
+    SimulatedPointCloudProjector,
+)
+
 
 DEFAULT_XT16_VERTICAL_ANGLES_DEG = tuple(-15.0 + 2.0 * index for index in range(16))
 
@@ -24,7 +29,12 @@ class Xt16LidarConfig:
 
     channels: int = 16
     vertical_angles_deg: tuple[float, ...] = DEFAULT_XT16_VERTICAL_ANGLES_DEG
+    points_per_frame: int = 32000
+    # Expensive terrain intersections are evaluated on a coarser angular
+    # anchor scan, then range-continuous sectors are interpolated to the full
+    # 32000-slot XT16 scan. This preserves training throughput.
     horizontal_resolution_deg: float = 2.0
+    maximum_interpolation_range_difference_m: float = 0.50
     minimum_range_m: float = 0.20
     maximum_range_m: float = 12.0
     ray_step_m: float = 0.08
@@ -39,10 +49,13 @@ class Xt16LidarConfig:
     time_jitter_std_s: float = 0.005
     beam_dropout_probability: float = 0.03
     return_dropout_probability: float = 0.02
+    projection_config: PointCloudProjectionConfig | None = None
 
     def validate(self) -> None:
         if self.channels <= 0 or len(self.vertical_angles_deg) != self.channels:
             raise ValueError("XT16垂直角数量必须与channels一致")
+        if self.points_per_frame <= 0 or self.points_per_frame % self.channels != 0:
+            raise ValueError("XT16 points_per_frame必须为channels的正整数倍")
         if not all(-90.0 < float(angle) < 90.0 for angle in self.vertical_angles_deg):
             raise ValueError("XT16垂直角必须位于(-90,90)度")
         if not 0.0 < self.horizontal_resolution_deg <= 20.0:
@@ -51,6 +64,8 @@ class Xt16LidarConfig:
             raise ValueError("XT16量程必须满足0 <= minimum < maximum")
         if self.ray_step_m <= 0.0 or self.ray_step_m > self.maximum_range_m:
             raise ValueError("XT16射线步长无效")
+        if self.maximum_interpolation_range_difference_m <= 0.0:
+            raise ValueError("XT16插值量程差阈值必须大于0")
         if self.mount_height_m <= 0.0 or self.scan_frequency_hz <= 0.0:
             raise ValueError("XT16安装高度和扫描频率必须大于0")
         if self.ray_chunk_size <= 0:
@@ -69,6 +84,7 @@ class Xt16LidarConfig:
                 raise ValueError(f"XT16 {name}必须位于[0,1]")
         if self.beam_dropout_probability + self.return_dropout_probability > 1.0:
             raise ValueError("XT16整束丢失率与回波丢失率之和不能超过1")
+        (self.projection_config or PointCloudProjectionConfig()).validate()
 
 
 class SimulatedXt16Lidar:
@@ -84,13 +100,13 @@ class SimulatedXt16Lidar:
         self.num_envs = int(num_envs)
         self.device = torch.device(device)
 
-        horizontal_count = max(
+        trace_horizontal_count = max(
             1, int(round(360.0 / self.cfg.horizontal_resolution_deg))
         )
-        horizontal_angles = torch.linspace(
+        trace_horizontal_angles = torch.linspace(
             -torch.pi,
             torch.pi,
-            horizontal_count + 1,
+            trace_horizontal_count + 1,
             device=self.device,
             dtype=torch.float32,
         )[:-1]
@@ -103,7 +119,7 @@ class SimulatedXt16Lidar:
         )
         pitch, azimuth = torch.meshgrid(
             vertical_angles,
-            horizontal_angles,
+            trace_horizontal_angles,
             indexing="ij",
         )
         self.pitch = pitch.reshape(-1)
@@ -114,7 +130,32 @@ class SimulatedXt16Lidar:
         self.scan_time_offset = (
             self.azimuth / (2.0 * torch.pi * self.cfg.scan_frequency_hz)
         )
-        self.num_rays = int(self.azimuth.numel())
+        self.num_trace_rays = int(self.azimuth.numel())
+        self.num_rays = int(self.cfg.points_per_frame)
+        self.raw_horizontal_count = self.num_rays // self.cfg.channels
+
+        raw_position = (
+            torch.arange(
+                self.raw_horizontal_count,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            * float(trace_horizontal_count)
+            / float(self.raw_horizontal_count)
+        )
+        left_horizontal = torch.floor(raw_position).long() % trace_horizontal_count
+        right_horizontal = (left_horizontal + 1) % trace_horizontal_count
+        alpha = raw_position - torch.floor(raw_position)
+        channel_offset = (
+            torch.arange(self.cfg.channels, device=self.device, dtype=torch.long)
+            * trace_horizontal_count
+        )[:, None]
+        self.raw_left_index = (channel_offset + left_horizontal[None, :]).reshape(-1)
+        self.raw_right_index = (channel_offset + right_horizontal[None, :]).reshape(-1)
+        self.raw_interpolation_alpha = alpha.repeat(self.cfg.channels)
+        self.projector = SimulatedPointCloudProjector(
+            self.cfg.projection_config or PointCloudProjectionConfig()
+        )
         self.last_pointcloud = torch.full(
             (self.num_envs, self.num_rays, 3),
             torch.nan,
@@ -132,6 +173,60 @@ class SimulatedXt16Lidar:
             dtype=torch.bool,
             device=self.device,
         )
+
+    def _densify_anchor_scan(self, trace_points, trace_ranges, trace_hit_mask):
+        """Interpolate a coarse first-hit scan into exactly 32000 XT16 slots."""
+        import torch
+
+        left_points = trace_points[:, self.raw_left_index]
+        right_points = trace_points[:, self.raw_right_index]
+        left_ranges = trace_ranges[:, self.raw_left_index]
+        right_ranges = trace_ranges[:, self.raw_right_index]
+        left_valid = trace_hit_mask[:, self.raw_left_index]
+        right_valid = trace_hit_mask[:, self.raw_right_index]
+        alpha = self.raw_interpolation_alpha.to(dtype=trace_points.dtype)[None, :]
+        continuous = (
+            left_valid
+            & right_valid
+            & (
+                (left_ranges - right_ranges).abs()
+                <= self.cfg.maximum_interpolation_range_difference_m
+            )
+        )
+        interpolated_points = torch.lerp(
+            left_points,
+            right_points,
+            alpha[:, :, None],
+        )
+        interpolated_ranges = torch.lerp(left_ranges, right_ranges, alpha)
+
+        prefer_left = alpha <= 0.5
+        choose_left = left_valid & (~right_valid | prefer_left)
+        nearest_points = torch.where(
+            choose_left[:, :, None],
+            left_points,
+            right_points,
+        )
+        nearest_ranges = torch.where(choose_left, left_ranges, right_ranges)
+        nearest_valid = left_valid | right_valid
+        points = torch.where(
+            continuous[:, :, None],
+            interpolated_points,
+            nearest_points,
+        )
+        ranges = torch.where(continuous, interpolated_ranges, nearest_ranges)
+        valid = continuous | nearest_valid
+        points = torch.where(
+            valid[:, :, None],
+            points,
+            torch.full_like(points, torch.nan),
+        )
+        ranges = torch.where(
+            valid,
+            ranges,
+            torch.full_like(ranges, self.cfg.maximum_range_m),
+        )
+        return points, ranges, valid
 
     @staticmethod
     def _grid_indices(local_x, local_y, extent_m: float, size: int):
@@ -161,8 +256,6 @@ class SimulatedXt16Lidar:
         """Return a sparse lidar-derived map with shape ``[B,4,H,W]``."""
         import torch
 
-        from .grid_preprocessor import preprocess_grid_map_torch
-
         if pose.ndim != 2 or pose.shape[1] != 3:
             raise ValueError("XT16 pose必须为[B,3]")
         env_ids = terrain_model._environment_indices(pose.shape[0], env_ids)
@@ -176,19 +269,28 @@ class SimulatedXt16Lidar:
         cell_count = size * size
         dtype = pose.dtype
         ground_reference = terrain_model.ground_reference(pose, env_ids)
+        randomization_scale = terrain_model.domain_randomization_scale[env_ids]
 
         noisy_pose = pose.clone()
         if self.cfg.pose_xy_noise_std_m > 0.0:
-            noisy_pose[:, :2] += self.cfg.pose_xy_noise_std_m * torch.randn_like(
-                noisy_pose[:, :2]
+            noisy_pose[:, :2] += (
+                self.cfg.pose_xy_noise_std_m
+                * randomization_scale[:, None]
+                * torch.randn_like(noisy_pose[:, :2])
             )
         if self.cfg.pose_yaw_noise_std_rad > 0.0:
-            noisy_pose[:, 2] += self.cfg.pose_yaw_noise_std_rad * torch.randn_like(
-                noisy_pose[:, 2]
+            noisy_pose[:, 2] += (
+                self.cfg.pose_yaw_noise_std_rad
+                * randomization_scale
+                * torch.randn_like(noisy_pose[:, 2])
             )
         scan_jitter = torch.zeros(batch_size, dtype=dtype, device=self.device)
         if self.cfg.time_jitter_std_s > 0.0:
-            scan_jitter = self.cfg.time_jitter_std_s * torch.randn_like(scan_jitter)
+            scan_jitter = (
+                self.cfg.time_jitter_std_s
+                * randomization_scale
+                * torch.randn_like(scan_jitter)
+            )
 
         # The point cloud honors the physical sensor range. Only the subsequent
         # grid projection is cropped to the 10 m local-map footprint.
@@ -208,49 +310,32 @@ class SimulatedXt16Lidar:
             dtype=torch.bool,
             device=self.device,
         )
-        minimum_height = torch.full(
-            (batch_size * cell_count,),
-            torch.inf,
-            dtype=dtype,
-            device=self.device,
-        )
-        maximum_height = torch.full(
-            (batch_size * cell_count,),
-            -torch.inf,
-            dtype=dtype,
-            device=self.device,
-        )
-        hit_count = torch.zeros(
-            batch_size * cell_count,
-            dtype=torch.long,
-            device=self.device,
-        )
         batch_offsets = (
             torch.arange(batch_size, device=self.device, dtype=torch.long) * cell_count
         )
         current_yaw = pose[:, 2, None, None]
         current_cosine = torch.cos(current_yaw)
         current_sine = torch.sin(current_yaw)
-        all_points = torch.full(
-            (batch_size, self.num_rays, 3),
+        trace_points = torch.full(
+            (batch_size, self.num_trace_rays, 3),
             torch.nan,
             dtype=dtype,
             device=self.device,
         )
-        all_ranges = torch.full(
-            (batch_size, self.num_rays),
+        trace_ranges = torch.full(
+            (batch_size, self.num_trace_rays),
             self.cfg.maximum_range_m,
             dtype=dtype,
             device=self.device,
         )
-        all_hit_mask = torch.zeros(
-            (batch_size, self.num_rays),
+        trace_hit_mask = torch.zeros(
+            (batch_size, self.num_trace_rays),
             dtype=torch.bool,
             device=self.device,
         )
 
-        for ray_start in range(0, self.num_rays, self.cfg.ray_chunk_size):
-            ray_end = min(ray_start + self.cfg.ray_chunk_size, self.num_rays)
+        for ray_start in range(0, self.num_trace_rays, self.cfg.ray_chunk_size):
+            ray_end = min(ray_start + self.cfg.ray_chunk_size, self.num_trace_rays)
             azimuth = self.azimuth[ray_start:ray_end].to(dtype=dtype)
             pitch = self.pitch[ray_start:ray_end].to(dtype=dtype)
             cos_pitch = self.cos_pitch[ray_start:ray_end].to(dtype=dtype)
@@ -304,13 +389,20 @@ class SimulatedXt16Lidar:
                 dtype=dtype,
                 device=self.device,
             )
-            beam_dropped = random_sample < self.cfg.beam_dropout_probability
+            beam_dropout_probability = (
+                self.cfg.beam_dropout_probability
+                * randomization_scale[:, None]
+            )
+            return_dropout_probability = (
+                self.cfg.return_dropout_probability
+                * randomization_scale[:, None]
+            )
+            beam_dropped = random_sample < beam_dropout_probability
             return_dropped = (
-                random_sample >= self.cfg.beam_dropout_probability
+                random_sample >= beam_dropout_probability
             ) & (
                 random_sample
-                < self.cfg.beam_dropout_probability
-                + self.cfg.return_dropout_probability
+                < beam_dropout_probability + return_dropout_probability
             )
             local_azimuth = azimuth[None, :]
             occlusion_delta = torch.atan2(
@@ -353,7 +445,9 @@ class SimulatedXt16Lidar:
             selected_distance = sample_ranges[first_index]
             if self.cfg.range_noise_std_m > 0.0:
                 selected_distance = selected_distance + (
-                    self.cfg.range_noise_std_m * torch.randn_like(selected_distance)
+                    self.cfg.range_noise_std_m
+                    * randomization_scale[:, None]
+                    * torch.randn_like(selected_distance)
                 )
             selected_distance = selected_distance.clamp(
                 self.cfg.minimum_range_m,
@@ -373,7 +467,9 @@ class SimulatedXt16Lidar:
             hit_world_z = torch.where(sampled_obstacle, ray_hit_z, sampled_ground)
             if self.cfg.height_noise_std_m > 0.0:
                 hit_world_z = hit_world_z + (
-                    self.cfg.height_noise_std_m * torch.randn_like(hit_world_z)
+                    self.cfg.height_noise_std_m
+                    * randomization_scale[:, None]
+                    * torch.randn_like(hit_world_z)
                 )
             hit_local_x = (
                 torch.cos(pose[:, 2, None]) * (hit_world_x - pose[:, 0, None])
@@ -384,37 +480,6 @@ class SimulatedXt16Lidar:
                 + torch.cos(pose[:, 2, None]) * (hit_world_y - pose[:, 1, None])
             )
             hit_relative_z = hit_world_z - ground_reference[:, None]
-            hit_row, hit_column, hit_inside = self._grid_indices(
-                hit_local_x,
-                hit_local_y,
-                terrain_model.cfg.extent_m,
-                size,
-            )
-            valid_return &= hit_inside
-            global_hit_index = (
-                batch_offsets[:, None] + hit_row * size + hit_column
-            )
-            selected_global_index = global_hit_index[valid_return]
-            selected_height = hit_relative_z[valid_return]
-            minimum_height.scatter_reduce_(
-                0,
-                selected_global_index,
-                selected_height,
-                reduce="amin",
-                include_self=True,
-            )
-            maximum_height.scatter_reduce_(
-                0,
-                selected_global_index,
-                selected_height,
-                reduce="amax",
-                include_self=True,
-            )
-            hit_count.scatter_add_(
-                0,
-                selected_global_index,
-                torch.ones_like(selected_global_index),
-            )
 
             points = torch.stack(
                 (hit_local_x, hit_local_y, hit_relative_z), dim=-1
@@ -424,35 +489,30 @@ class SimulatedXt16Lidar:
                 points,
                 torch.full_like(points, torch.nan),
             )
-            all_points[:, ray_start:ray_end] = points
-            all_ranges[:, ray_start:ray_end] = torch.where(
+            trace_points[:, ray_start:ray_end] = points
+            trace_ranges[:, ray_start:ray_end] = torch.where(
                 valid_return,
                 selected_distance,
                 torch.full_like(selected_distance, self.cfg.maximum_range_m),
             )
-            all_hit_mask[:, ray_start:ray_end] = valid_return
+            trace_hit_mask[:, ray_start:ray_end] = valid_return
 
-        valid_height = hit_count > 0
-        ground_height = torch.where(
-            valid_height,
-            minimum_height,
-            torch.full_like(minimum_height, torch.nan),
-        ).reshape(batch_size, size, size)
-        height_range = torch.where(
-            valid_height,
-            maximum_height - minimum_height,
-            torch.full_like(maximum_height, torch.nan),
-        ).reshape(batch_size, size, size)
+        all_points, all_ranges, all_hit_mask = self._densify_anchor_scan(
+            trace_points,
+            trace_ranges,
+            trace_hit_mask,
+        )
         observed = observed_flat.reshape(batch_size, size, size).to(dtype=dtype)
-        result = preprocess_grid_map_torch(
-            ground_height,
-            height_range,
+        result = self.projector.project(
+            all_points,
             observed,
-            max_abs_relative_height=terrain_model.cfg.maximum_relative_height_m,
-            max_height_range=terrain_model.cfg.maximum_height_range_m,
+            extent_m=terrain_model.cfg.extent_m,
+            size=size,
+            maximum_relative_height_m=terrain_model.cfg.maximum_relative_height_m,
+            maximum_height_range_m=terrain_model.cfg.maximum_height_range_m,
             ground_fill_value=terrain_model.cfg.ground_fill_value,
             range_fill_value=terrain_model.cfg.range_fill_value,
-            normalize=terrain_model.cfg.normalize_heights,
+            normalize_heights=terrain_model.cfg.normalize_heights,
         )
         require_finite(result, "XT16投影局部地图")
         self.last_pointcloud[env_ids] = all_points.to(self.last_pointcloud.dtype)
