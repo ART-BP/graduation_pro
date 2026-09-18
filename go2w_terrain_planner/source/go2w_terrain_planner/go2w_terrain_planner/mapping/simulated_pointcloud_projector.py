@@ -20,14 +20,14 @@ class PointCloudProjectionConfig:
 
     input_crop_length_x_m: float = 12.0
     input_crop_length_y_m: float = 12.0
-    body_height_m: float = 0.35
+    body_height_m: float = 0.50
     vertical_min_offset_m: float = -1.5
     vertical_max_offset_m: float = 1.5
-    ground_percentile: float = 0.10
+    ground_percentile: float = 0.01
     span_lower_percentile: float = 0.05
     span_upper_percentile: float = 0.95
     minimum_points_per_cell: int = 1
-    height_quantization_m: float = 1.0e-4
+    height_quantization_m: float = 1.0e-3
     maximum_ground_deviation_m: float = 0.12
     fusion_span_percentile: float = 0.75
 
@@ -62,7 +62,6 @@ class SimulatedPointCloudProjector:
     def __init__(self, cfg: PointCloudProjectionConfig | None = None) -> None:
         self.cfg = cfg or PointCloudProjectionConfig()
         self.cfg.validate()
-        self.last_point_count = None
 
     @staticmethod
     def _empty_measurements(batch_size: int, size: int, *, dtype, device):
@@ -75,21 +74,16 @@ class SimulatedPointCloudProjector:
             device=device,
         )
         height_range = torch.full_like(ground, torch.nan)
-        point_count = torch.zeros(
-            (batch_size, size, size),
-            dtype=torch.long,
-            device=device,
-        )
-        return ground, height_range, point_count
+        return ground, height_range
 
     def _robust_cell_statistics(self, pointcloud, extent_m: float, size: int):
-        """Return low ground quantile, robust span, and count for every cell."""
+        """Return the low ground quantile and robust span for every cell."""
         import torch
 
         batch_size = int(pointcloud.shape[0])
         dtype = pointcloud.dtype
         device = pointcloud.device
-        ground, height_range, point_count = self._empty_measurements(
+        ground, height_range = self._empty_measurements(
             batch_size,
             size,
             dtype=dtype,
@@ -167,11 +161,9 @@ class SimulatedPointCloudProjector:
 
         flat_ground = ground.reshape(-1)
         flat_range = height_range.reshape(-1)
-        flat_count = point_count.reshape(-1)
         flat_ground[selected_cells] = selected_ground
         flat_range[selected_cells] = (selected_upper - selected_lower).clamp(min=0.0)
-        flat_count[unique_cells] = counts
-        return ground, height_range, point_count
+        return ground, height_range
 
     def project(
         self,
@@ -193,12 +185,11 @@ class SimulatedPointCloudProjector:
             raise ValueError("pointcloud必须为[B,N,3]")
         if ray_observed.shape != (pointcloud.shape[0], size, size):
             raise ValueError("ray_observed必须为[B,H,W]")
-        ground, height_range, point_count = self._robust_cell_statistics(
+        ground, height_range = self._robust_cell_statistics(
             pointcloud,
             extent_m,
             size,
         )
-        self.last_point_count = point_count
         result = preprocess_grid_map_torch(
             ground,
             height_range,

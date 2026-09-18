@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 from go2w_terrain_planner.utils.tensor_checks import require_finite
 
 _TARGET_GRID_CACHE: dict[tuple[str, str, int, int, float], tuple[object, object]] = {}
@@ -39,18 +37,11 @@ def _target_grid(torch, device, dtype, height: int, width: int, extent_m: float)
     return cached
 
 
-def wrap_angle(angle):
-    """Wrap NumPy scalars/arrays or torch tensors to ``[-pi, pi)``."""
-    try:
-        import torch
+def _wrap_angle(angle):
+    """Wrap a torch tensor to ``[-pi, pi)``."""
+    import torch
 
-        if isinstance(angle, torch.Tensor):
-            return torch.atan2(torch.sin(angle), torch.cos(angle))
-    except ImportError:
-        pass
-    import numpy as np
-
-    return np.arctan2(np.sin(angle), np.cos(angle))
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
 def encode_local_goal(robot_pose, goal_xy, maximum_distance: float):
@@ -66,7 +57,7 @@ def encode_local_goal(robot_pose, goal_xy, maximum_distance: float):
     delta = goal - pose[..., :2]
     distance = torch.linalg.vector_norm(delta, dim=-1)
     bearing_world = torch.atan2(delta[..., 1], delta[..., 0])
-    bearing_robot = wrap_angle(bearing_world - pose[..., 2])
+    bearing_robot = _wrap_angle(bearing_world - pose[..., 2])
     return torch.stack(
         (torch.clamp(distance / maximum_distance, 0.0, 1.0), torch.sin(bearing_robot), torch.cos(bearing_robot)),
         dim=-1,
@@ -85,7 +76,7 @@ def relative_pose_deltas(poses):
     sine = torch.sin(yaw)
     dx = cosine * world_delta[..., 0] + sine * world_delta[..., 1]
     dy = -sine * world_delta[..., 0] + cosine * world_delta[..., 1]
-    dyaw = wrap_angle(poses[:, 1:, 2] - poses[:, :-1, 2])
+    dyaw = _wrap_angle(poses[:, 1:, 2] - poses[:, :-1, 2])
     return torch.stack((dx, dy, dyaw), dim=-1)
 
 
@@ -225,25 +216,3 @@ def warp_map_sequence(
         )
     require_finite(result, "地图对齐结果")
     return result
-
-
-def world_aligned_map_to_robot_frame(world_aligned_map, robot_yaw, extent_m: float):
-    """Rotate an odom-axis Grid Map into the robot-centric convention used by the Actor."""
-    import torch
-
-    maps = torch.as_tensor(world_aligned_map, dtype=torch.float32)
-    squeeze = maps.ndim == 3
-    if squeeze:
-        maps = maps.unsqueeze(0)
-    if maps.ndim != 4 or maps.shape[1] != 4:
-        raise ValueError("world_aligned_map必须为[4,H,W]或[B,4,H,W]")
-    yaw = torch.as_tensor(robot_yaw, dtype=maps.dtype, device=maps.device)
-    if yaw.ndim == 0:
-        yaw = yaw.expand(maps.shape[0])
-    if yaw.shape != (maps.shape[0],):
-        raise ValueError("robot_yaw必须是标量或[B]")
-    source_pose = torch.zeros((maps.shape[0], 1, 3), dtype=maps.dtype, device=maps.device)
-    target_pose = torch.zeros((maps.shape[0], 3), dtype=maps.dtype, device=maps.device)
-    target_pose[:, 2] = yaw
-    result = warp_map_sequence(maps[:, None], source_pose, target_pose, extent_m)[:, 0]
-    return result[0] if squeeze else result

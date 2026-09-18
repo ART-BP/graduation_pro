@@ -1,32 +1,41 @@
-import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from go2w_terrain_planner.mapping.grid_preprocessor import (
     downsample_map_tensor,
-    preprocess_grid_map,
     preprocess_grid_map_torch,
 )
 
 
-def test_numpy_and_torch_preprocessing_match() -> None:
-    ground = np.array([[0.0, np.nan], [0.3, 1.5]], dtype=np.float32)
-    height_range = np.array([[0.0, np.nan], [0.3, 4.0]], dtype=np.float32)
-    observed = np.ones((2, 2), dtype=np.float32)
-    expected = preprocess_grid_map(
-        ground,
-        height_range,
-        observed,
-        normalize=True,
-    )
+def test_torch_preprocessing_normalizes_and_cleans_invalid_heights() -> None:
+    ground = torch.tensor([[0.0, torch.nan], [0.3, 1.5]])
+    height_range = torch.tensor([[0.0, torch.nan], [0.3, 4.0]])
+    observed = torch.ones((2, 2))
     actual = preprocess_grid_map_torch(
         ground,
         height_range,
         observed,
         normalize=True,
     )
-    assert np.allclose(np.asarray(actual.tolist(), dtype=np.float32), expected)
+    expected = torch.tensor(
+        [
+            [[0.0, 0.0], [0.2, 1.0]],
+            [[0.0, 0.0], [0.1, 1.0]],
+            [[1.0, 1.0], [1.0, 1.0]],
+            [[1.0, 0.0], [1.0, 1.0]],
+        ]
+    )
+    assert torch.allclose(actual, expected)
+
+
+def test_torch_preprocessing_rejects_shape_mismatch() -> None:
+    with pytest.raises(ValueError, match="尺寸必须一致"):
+        preprocess_grid_map_torch(
+            torch.zeros((10, 10)),
+            torch.zeros((8, 10)),
+            torch.zeros((10, 10)),
+        )
 
 
 def test_downsample_preserves_channel_contract() -> None:

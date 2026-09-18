@@ -91,7 +91,7 @@ height_valid_mask = isfinite(ground_height) AND isfinite(height_range)
 
 仿真端默认使用 `sensor.observation_source: raycast`。射线传感器输出保存在
 `SimulatedLocalMap.lidar_sensor.last_pointcloud`，默认形状为 `[B,32000,3]`，坐标系为当前机器人局部坐标系，
-无回波射线填充为 `NaN`；`last_ranges` 和 `last_hit_mask` 分别提供量程与有效回波掩码。地形执行、碰撞和
+无回波射线填充为 `NaN`；`last_hit_mask` 提供有效回波掩码。地形执行、碰撞和
 失稳判定仍使用独立的解析真值，Actor 只能看到由射线穿越与命中点投影得到的地图，避免特权信息泄漏。
 为保持32个并行环境的吞吐，地形求交先在2度水平锚点上进行，只在相邻量程连续的扇区内插值到每线2000
 个水平采样槽，几何突变边界采用最近有效锚点。独立的纯PyTorch投影器随后执行12 m输入裁剪、0.05 m栅格分组、10%
@@ -103,7 +103,7 @@ height_valid_mask = isfinite(ground_height) AND isfinite(height_range)
 
 所有无效高度都被固定值替换，进入网络的张量不允许包含 `NaN` 或 `Inf`。地面高程按`±1 m`归一化，高度差保持`0～3 m`覆盖范围；网络直接使用`200 × 200`地图。
 
-实机 Grid Map 的栅格轴与 `odom` 对齐，送入 Actor 前还要调用 `world_aligned_map_to_robot_frame()` 按当前 yaw 转成机器人坐标约定；随后再进入 `TemporalGridBuffer`。这样仿真端和实机端的“地图前方”方向一致。
+实机部署适配器应直接输出机器人中心坐标系下的四通道地图，再进入 `TemporalGridBuffer`；仿真端和实机端都约定地图第一维为机器人前向、第二维为机器人左向。
 
 Actor 输入为：
 

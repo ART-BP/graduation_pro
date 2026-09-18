@@ -18,7 +18,7 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
     """The proxy is intentionally replaceable by a calibrated Go2W asset later."""
 
     decimation = 5
-    episode_length_s = 30.0
+    episode_length_s = 50.0
     action_space = 2
     observation_space = DEFAULT_POLICY_OBSERVATION_DIMENSION
     state_space = CRITIC_OBSERVATION_DIMENSION
@@ -40,7 +40,7 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.12, 0.42, 0.80)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.20)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.25)),
     )
 
     map_extent_m = 10.0
@@ -55,8 +55,8 @@ class TerrainNavigationEnvCfg(DirectRLEnvCfg):
     local_goal_maximum_m = 10.0
     goal_tolerance_m = 0.50
     maximum_distance_m = 15.0
-    collision_height_range_m = 0.45
-    unstable_risk_threshold = 0.20
+    collision_height_range_m = 0.35
+    unstable_risk_threshold = 0.25
     maximum_tilt_rad = 0.65
     fall_tilt_rad = 1.00
     stuck_timeout_s = 2.0

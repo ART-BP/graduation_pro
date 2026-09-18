@@ -93,7 +93,6 @@ def test_pointcloud_projection_uses_robust_height_percentiles() -> None:
     assert result[0, 1, 2, 2].item() < 0.1
     assert result[0, 2, 2, 2].item() == 1.0
     assert result[0, 3, 2, 2].item() == 1.0
-    assert projector.last_point_count[0, 2, 2].item() == 10
 
 
 def test_raycast_flat_map_comes_from_sparse_returns_and_traversed_cells() -> None:

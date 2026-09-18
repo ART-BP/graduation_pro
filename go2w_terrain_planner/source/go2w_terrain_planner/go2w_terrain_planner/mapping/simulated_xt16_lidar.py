@@ -162,12 +162,6 @@ class SimulatedXt16Lidar:
             dtype=torch.float32,
             device=self.device,
         )
-        self.last_ranges = torch.full(
-            (self.num_envs, self.num_rays),
-            self.cfg.maximum_range_m,
-            dtype=torch.float32,
-            device=self.device,
-        )
         self.last_hit_mask = torch.zeros(
             (self.num_envs, self.num_rays),
             dtype=torch.bool,
@@ -198,8 +192,6 @@ class SimulatedXt16Lidar:
             right_points,
             alpha[:, :, None],
         )
-        interpolated_ranges = torch.lerp(left_ranges, right_ranges, alpha)
-
         prefer_left = alpha <= 0.5
         choose_left = left_valid & (~right_valid | prefer_left)
         nearest_points = torch.where(
@@ -207,26 +199,19 @@ class SimulatedXt16Lidar:
             left_points,
             right_points,
         )
-        nearest_ranges = torch.where(choose_left, left_ranges, right_ranges)
         nearest_valid = left_valid | right_valid
         points = torch.where(
             continuous[:, :, None],
             interpolated_points,
             nearest_points,
         )
-        ranges = torch.where(continuous, interpolated_ranges, nearest_ranges)
         valid = continuous | nearest_valid
         points = torch.where(
             valid[:, :, None],
             points,
             torch.full_like(points, torch.nan),
         )
-        ranges = torch.where(
-            valid,
-            ranges,
-            torch.full_like(ranges, self.cfg.maximum_range_m),
-        )
-        return points, ranges, valid
+        return points, valid
 
     @staticmethod
     def _grid_indices(local_x, local_y, extent_m: float, size: int):
@@ -497,7 +482,7 @@ class SimulatedXt16Lidar:
             )
             trace_hit_mask[:, ray_start:ray_end] = valid_return
 
-        all_points, all_ranges, all_hit_mask = self._densify_anchor_scan(
+        all_points, all_hit_mask = self._densify_anchor_scan(
             trace_points,
             trace_ranges,
             trace_hit_mask,
@@ -516,7 +501,6 @@ class SimulatedXt16Lidar:
         )
         require_finite(result, "XT16投影局部地图")
         self.last_pointcloud[env_ids] = all_points.to(self.last_pointcloud.dtype)
-        self.last_ranges[env_ids] = all_ranges.to(self.last_ranges.dtype)
         self.last_hit_mask[env_ids] = all_hit_mask
         if return_ground_reference:
             return result, ground_reference

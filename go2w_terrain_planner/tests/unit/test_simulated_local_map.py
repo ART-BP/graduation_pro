@@ -361,8 +361,8 @@ def test_wall_navigation_potential_rewards_lateral_detour() -> None:
     lateral_euclidean = torch.linalg.vector_norm(
         goal - lateral_pose[:, :2], dim=-1
     )
-    direct_potential = generator.navigation_potential(direct_pose, goal)
-    lateral_potential = generator.navigation_potential(lateral_pose, goal)
+    direct_potential = generator.navigation_guidance(direct_pose, goal).potential_m
+    lateral_potential = generator.navigation_guidance(lateral_pose, goal).potential_m
 
     assert direct_potential > direct_euclidean
     assert lateral_euclidean > direct_euclidean
@@ -384,7 +384,7 @@ def test_navigation_potential_returns_to_euclidean_after_wall_is_cleared() -> No
     pose = torch.tensor([[-1.0, 6.0, 0.0]])
     goal = torch.tensor([[1.0, 0.0]])
 
-    potential = generator.navigation_potential(pose, goal)
+    potential = generator.navigation_guidance(pose, goal).potential_m
     euclidean = torch.linalg.vector_norm(goal - pose[:, :2], dim=-1)
 
     assert potential.item() == pytest.approx(euclidean.item())

@@ -37,7 +37,7 @@ class Go2wPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """整个训练运行器配置"""
     num_steps_per_env = 96
     max_iterations = 10000
-    save_interval = 200
+    save_interval = 500
     experiment_name = "go2w_terrain_navigation"
     run_name = "phase12_nine_stage_curriculum"
     device = "cuda:0"

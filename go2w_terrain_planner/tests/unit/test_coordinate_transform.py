@@ -6,7 +6,6 @@ from go2w_terrain_planner.mapping.coordinate_transform import (
     encode_local_goal,
     relative_pose_deltas,
     warp_map_sequence,
-    world_aligned_map_to_robot_frame,
 )
 
 
@@ -70,13 +69,3 @@ def test_height_range_warp_keeps_peak_value() -> None:
     result = warp_map_sequence(maps, source_pose, target_pose, extent_m=9.0)
 
     assert result[:, :, 1].max().item() == pytest.approx(1.0)
-
-
-def test_world_aligned_map_rotation_stays_finite() -> None:
-    world_map = torch.zeros((4, 9, 9))
-    world_map[0, 6, 4] = 1.0
-    world_map[2:, 6, 4] = 1.0
-    robot_map = world_aligned_map_to_robot_frame(world_map, torch.pi / 2, extent_m=9.0)
-    assert robot_map.shape == world_map.shape
-    assert torch.isfinite(robot_map).all()
-    assert robot_map[3].sum().item() == pytest.approx(1.0)

@@ -767,10 +767,6 @@ class SimulatedLocalMap:
             blocked=blocked,
         )
 
-    def navigation_potential(self, pose, goal_xy, env_ids=None):
-        """Return the obstacle-aware remaining path length."""
-        return self.navigation_guidance(pose, goal_xy, env_ids).potential_m
-
     def _environment_indices(self, batch_size: int, env_ids=None):
         import torch
 
