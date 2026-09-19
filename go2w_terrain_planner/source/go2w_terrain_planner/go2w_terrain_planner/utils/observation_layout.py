@@ -21,8 +21,8 @@ CRITIC_OBSERVATION_COMPONENTS = {
     "observed_terrain_risk": 1,
     "unknown_ratio": 1,
     "stuck_fraction": 1,
-    "command_history": 8,
-    "motion_history": 12,
+    "command_history": 16,
+    "motion_history": 24,
 }
 CRITIC_OBSERVATION_DIMENSION = sum(CRITIC_OBSERVATION_COMPONENTS.values())
 
@@ -62,9 +62,35 @@ def policy_observation_dimension(
     )
 
 
+def critic_observation_dimension(
+    *,
+    command_history_length: int,
+    motion_history_length: int,
+) -> int:
+    """Return the privileged Critic dimension for configurable histories."""
+
+    if (
+        not isinstance(command_history_length, int)
+        or not isinstance(motion_history_length, int)
+        or command_history_length <= 0
+        or motion_history_length <= 0
+    ):
+        raise ValueError("Critic历史长度必须为正整数")
+    history_dimension = (
+        CRITIC_OBSERVATION_COMPONENTS["command_history"]
+        + CRITIC_OBSERVATION_COMPONENTS["motion_history"]
+    )
+    fixed_dimension = CRITIC_OBSERVATION_DIMENSION - history_dimension
+    return (
+        fixed_dimension
+        + 2 * command_history_length
+        + 3 * motion_history_length
+    )
+
+
 DEFAULT_POLICY_OBSERVATION_DIMENSION = policy_observation_dimension(
     map_channels=ACTOR_MAP_CHANNELS,
     map_size=200,
-    command_history_length=4,
-    motion_history_length=4,
+    command_history_length=8,
+    motion_history_length=8,
 )

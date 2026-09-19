@@ -206,7 +206,7 @@ def test_removed_full_map_stack_architecture_is_rejected() -> None:
     history, channels, size, auxiliary = 2, 7, 16, 15
     policy_dim = channels * size * size + auxiliary
     obs = {"policy": torch.zeros((1, policy_dim)), "critic": torch.zeros((1, 7))}
-    with pytest.raises(ValueError, match="compact_map_motion_gru_v6"):
+    with pytest.raises(ValueError, match="compact_map_motion_gru_v7"):
         Go2wActorCritic(
             obs,
             {"policy": ["policy"], "critic": ["critic"]},

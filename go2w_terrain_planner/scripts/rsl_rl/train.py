@@ -240,7 +240,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             required_action_std_parameterization_version=(
                 2 if load_optimizer else None
             ),
-            required_policy_architecture_version=6,
+            required_policy_architecture_version=7,
         )
 
     # specify directory for logging runs: {time-stamp}_{run_name}

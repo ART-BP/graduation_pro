@@ -111,7 +111,7 @@ def test_short_regression_is_penalized_less_than_equal_progress_is_rewarded() ->
         return_terms=True,
     )
 
-    assert terms["progress"][0].item() == pytest.approx(0.8)
+    assert terms["progress"][0].item() == pytest.approx(1.0)
     assert terms["progress"][1].item() == pytest.approx(0.0)
     assert terms["regression"][0].item() == pytest.approx(0.0)
     assert terms["regression"][1].item() == pytest.approx(-0.1)
@@ -139,7 +139,7 @@ def test_progress_cannot_be_collected_repeatedly_by_oscillation() -> None:
         return_terms=True,
     )
 
-    assert terms["progress"].tolist() == pytest.approx([8.0, 0.0, 0.0])
+    assert terms["progress"].tolist() == pytest.approx([10.0, 0.0, 0.0])
     assert terms["regression"].tolist() == pytest.approx([0.0, -1.0, 0.0])
 
 
@@ -191,4 +191,4 @@ def test_terrain_risk_penalizes_fast_motion_but_not_stopping() -> None:
     )
 
     assert terms["terrain_speed_risk"][0].item() == pytest.approx(0.0)
-    assert terms["terrain_speed_risk"][1].item() == pytest.approx(-0.15)
+    assert terms["terrain_speed_risk"][1].item() == pytest.approx(-0.75)

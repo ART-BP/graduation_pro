@@ -14,7 +14,7 @@ os.environ.setdefault("GO2W_SKIP_TASK_IMPORT", "1")
 
 from go2w_terrain_planner.models import ActorExportWrapper, Go2wActorCritic
 from go2w_terrain_planner.utils.observation_layout import (
-    CRITIC_OBSERVATION_DIMENSION,
+    critic_observation_dimension,
     policy_observation_dimension,
 )
 from go2w_terrain_planner.utils.config_loader import load_project_config
@@ -45,7 +45,14 @@ def main() -> None:
     observations = {
         "policy": torch.zeros((1, policy_dim), dtype=torch.float32),
         "critic": torch.zeros(
-            (1, CRITIC_OBSERVATION_DIMENSION), dtype=torch.float32
+            (
+                1,
+                critic_observation_dimension(
+                    command_history_length=int(history_config["command_length"]),
+                    motion_history_length=int(history_config["motion_length"]),
+                ),
+            ),
+            dtype=torch.float32,
         ),
     }
     model = Go2wActorCritic(
@@ -70,7 +77,7 @@ def main() -> None:
     validate_checkpoint(
         args.checkpoint,
         include_optimizer=False,
-        required_policy_architecture_version=6,
+        required_policy_architecture_version=7,
     )
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state = checkpoint.get("model_state_dict", checkpoint.get("model"))

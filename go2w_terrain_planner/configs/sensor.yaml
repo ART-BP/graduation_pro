@@ -1,35 +1,27 @@
 sensor:
-  # raycast使用16线首回波点云生成地图；analytic保留为快速消融基线。
-  observation_source: raycast
+  # Actor观测只来自Isaac Lab对静态三角网格执行的原生GPU射线求交。
   height_noise_std_m: 0.015
   range_noise_std_m: 0.010
-  random_missing_probability: 0.03
-  ray_only_probability: 0.02
-  occlusion_sector_probability: 0.30
-  occlusion_width_range_rad: [0.10, 0.50]
+  # 真实射线本身和已命中回波的丢失分开建模。
+  beam_dropout_probability: 0.03
+  return_dropout_probability: 0.02
   pose_xy_noise_std_m: 0.015
   pose_yaw_noise_std_rad: 0.01
-  time_jitter_std_s: 0.005
   lidar:
     channels: 16
-    # XT16在10 Hz下每帧保留32000个扫描槽；无回波槽在张量中为NaN。
+    # 每个槽对应一条独立射线；16线×每线2000个方位角=32000条射线。
     points_per_frame: 32000
-    # 当前为可配置的16线近似角；获得XT16标定表后直接替换该数组。
+    scan_frequency_hz: 10.0
+    # XT16名义角表；有实机逐台标定文件时可直接替换，不只使用FOV端点。
     vertical_angles_deg: [-15.0, -13.0, -11.0, -9.0, -7.0, -5.0, -3.0, -1.0,
                           1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0]
-    # 地形首回波先按2度锚点求交，再插值到每线2000个水平采样点；
-    # 避免32个并行环境直接执行约1.5亿次逐距离地形查询。
-    horizontal_resolution_deg: 2.0
-    maximum_interpolation_range_difference_m: 0.50
+    horizontal_resolution_deg: 0.18
     minimum_range_m: 0.20
+    # 局部点云只裁剪到12 m×12 m，12 m射程已覆盖裁剪区对角线并减少无效求交。
     maximum_range_m: 12.0
-    ray_step_m: 0.08
-    mount_height_m: 0.45
-    scan_frequency_hz: 10.0
-    motion_distortion: true
-    ray_chunk_size: 256
+    mount_height_m: 0.55
     projection:
-      # 与local_map_ws保持相同的12 m输入裁剪和0.05 m内部高程栅格语义。
+      # 与local_map_ws保持相同的12 m输入裁剪和0.05 m内部栅格语义。
       input_crop_length_x_m: 12.0
       input_crop_length_y_m: 12.0
       body_height_m: 0.35
@@ -38,8 +30,10 @@ sensor:
       ground_percentile: 0.10
       span_lower_percentile: 0.05
       span_upper_percentile: 0.95
-      minimum_points_per_cell: 1
-      height_quantization_m: 0.0001
-      # 对齐后只融合地面高度相差不超过12 cm的最密集时间簇。
-      maximum_ground_deviation_m: 0.12
+      # 至少两个真实回波才把地面/高度差作为有效测量，避免单点高度差恒为零。
+      minimum_points_per_cell: 2
+      # 1 mm量化远小于传感器噪声，同时避免无意义的0.1 mm排序精度。
+      height_quantization_m: 0.001
+      # 6 cm阈值可容纳噪声，但不会把5～10 cm小台阶普遍合并。
+      maximum_ground_deviation_m: 0.06
       fusion_span_percentile: 0.75

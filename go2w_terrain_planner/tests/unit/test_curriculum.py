@@ -8,7 +8,7 @@ from go2w_terrain_planner.tasks.direct.terrain_navigation.curriculum import (
     CurriculumStageSchedule,
     CapabilityCurriculum,
 )
-from go2w_terrain_planner.mapping.simulated_local_map import TERRAIN_NAMES
+from go2w_terrain_planner.mapping.terrain_truth_model import TERRAIN_NAMES
 from go2w_terrain_planner.utils.config_loader import load_project_config
 
 
@@ -220,6 +220,29 @@ def test_stage_schedule_uses_explicit_goal_ranges() -> None:
     assert batch.goal_maximum_m.tolist() == pytest.approx([2.5, 6.0, 10.0])
     assert batch.domain_randomization_scale.tolist() == pytest.approx(
         [0.0, 0.0, 1.0]
+    )
+
+
+def test_non_progressive_flat_stages_are_full_difficulty_immediately() -> None:
+    config_dir = Path(__file__).resolve().parents[2] / "configs"
+    config = load_project_config(config_dir)
+    schedule = CurriculumStageSchedule(
+        config["curriculum"]["stages"], TERRAIN_NAMES, "cpu"
+    )
+    batch = schedule.sample(
+        torch.tensor([1, 2, 3]),
+        torch.zeros(3),
+        frontier_probability=1.0,
+        challenge_probability=0.0,
+        challenge_stage_span=1,
+    )
+
+    assert batch.stages.tolist() == [1, 2, 3]
+    assert batch.curriculum_difficulty.tolist() == pytest.approx(
+        [1.0, 1.0, 0.0]
+    )
+    assert batch.geometry_difficulty.tolist() == pytest.approx(
+        [0.0, 0.0, 0.0]
     )
 
 

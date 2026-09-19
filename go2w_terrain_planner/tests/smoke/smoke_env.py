@@ -61,7 +61,7 @@ def main() -> None:
     env = gym.make(task, cfg=env_cfg)
     observation, _ = env.reset()
     assert_finite_observation(observation)
-    map_generator = env.unwrapped.map_generator
+    lidar_mapper = env.unwrapped.lidar_mapper
     reset_count = 1
     torch.cuda.synchronize()
     step_start = time.perf_counter()
@@ -85,13 +85,28 @@ def main() -> None:
     height_valid_ratio = float(
         env.unwrapped.current_map[:, 3].mean().item()
     )
-    if map_generator.lidar_sensor is not None:
-        point_slots_per_frame = int(map_generator.lidar_sensor.num_rays)
-        mean_point_count = float(
-            map_generator.lidar_sensor.last_hit_mask.sum(dim=1).float().mean().item()
-        )
-        if mean_point_count <= 0.0:
-            raise RuntimeError("raycast smoke test produced no lidar returns")
+    maximum_absolute_ground = float(
+        env.unwrapped.current_map[:, 0].abs().amax().item()
+    )
+    maximum_height_range = float(
+        env.unwrapped.current_map[:, 1].amax().item()
+    )
+    terrain_type_indices = (
+        env.unwrapped.terrain_truth.terrain_type.detach().cpu().tolist()
+    )
+    physical_geometry_synchronized = bool(
+        env.unwrapped.terrain_truth.geometry_is_fixed.all().item()
+    )
+    point_slots_per_frame = int(lidar_mapper.cfg.points_per_frame)
+    mean_point_count = float(
+        lidar_mapper.last_hit_mask.sum(dim=1).float().mean().item()
+    )
+    if mean_point_count <= 0.0:
+        raise RuntimeError("native RayCaster smoke test produced no lidar returns")
+    if observed_ratio <= 0.0 or height_valid_ratio <= 0.0:
+        raise RuntimeError("native RayCaster did not produce a usable terrain map")
+    if not physical_geometry_synchronized:
+        raise RuntimeError("terrain truth is not synchronized with the selected mesh tiles")
     env.close()
     output = Path(os.environ.get("GO2W_DATA_ROOT", "/workspace/data")) / "smoke"
     output.mkdir(parents=True, exist_ok=True)
@@ -102,11 +117,15 @@ def main() -> None:
         "resets": reset_count,
         "curriculum_minimum_stage": args_cli.curriculum_min_stage,
         "curriculum_maximum_stage": args_cli.curriculum_max_stage,
-        "observation_source": map_generator.cfg.observation_source,
+        "observation_source": "isaaclab_native_raycast",
         "point_slots_per_frame": point_slots_per_frame,
         "mean_lidar_point_count": mean_point_count,
         "observed_ratio": observed_ratio,
         "height_valid_ratio": height_valid_ratio,
+        "maximum_absolute_ground": maximum_absolute_ground,
+        "maximum_height_range": maximum_height_range,
+        "terrain_type_indices": terrain_type_indices,
+        "physical_geometry_synchronized": physical_geometry_synchronized,
         "policy_steps_per_second": args_cli.steps / step_elapsed_s,
         "environment_steps_per_second": (
             args_cli.steps * args_cli.num_envs / step_elapsed_s

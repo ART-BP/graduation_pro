@@ -7,22 +7,25 @@ from collections.abc import Sequence
 import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObject
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.utils.warp import raycast_mesh
 
 from go2w_terrain_planner.mapping.coordinate_transform import encode_local_goal
 from go2w_terrain_planner.mapping.grid_preprocessor import downsample_map_tensor
-from go2w_terrain_planner.mapping.simulated_local_map import (
-    SimulatedLocalMap,
-    SimulatedMapConfig,
+from go2w_terrain_planner.mapping.isaac_raycast_lidar import (
+    IsaacRaycastLidarConfig,
+    IsaacRaycastLidarMapper,
+    transform_lidar_rays_to_world,
+)
+from go2w_terrain_planner.mapping.terrain_truth_model import (
+    TerrainTruthModel,
+    TerrainTruthConfig,
     TERRAIN_NAMES,
     fuse_aligned_map_history,
 )
-from go2w_terrain_planner.mapping.simulated_pointcloud_projector import (
+from go2w_terrain_planner.mapping.pointcloud_grid_projector import (
     PointCloudProjectionConfig,
 )
-from go2w_terrain_planner.mapping.simulated_xt16_lidar import Xt16LidarConfig
 from go2w_terrain_planner.mapping.temporal_grid_buffer import TemporalGridBuffer
 from go2w_terrain_planner.robots.velocity_command_adapter import (
     ActionLimits,
@@ -142,7 +145,7 @@ class TerrainNavigationEnv(DirectRLEnv):
             projection_parameters["fusion_span_percentile"]
         )
         terrain_parameters = project_config["terrain"]
-        map_cfg = SimulatedMapConfig(
+        truth_cfg = TerrainTruthConfig(
             extent_m=cfg.map_extent_m,
             size=int(map_parameters["source_size"]),
             maximum_relative_height_m=float(map_parameters["max_abs_relative_height_m"]),
@@ -150,90 +153,6 @@ class TerrainNavigationEnv(DirectRLEnv):
             ground_fill_value=float(map_parameters["ground_fill_value"]),
             range_fill_value=float(map_parameters["range_fill_value"]),
             normalize_heights=bool(map_parameters["normalize_heights"]),
-            height_noise_std_m=float(sensor_parameters["height_noise_std_m"]),
-            range_noise_std_m=float(sensor_parameters["range_noise_std_m"]),
-            missing_probability=float(sensor_parameters["random_missing_probability"]),
-            ray_only_probability=float(sensor_parameters["ray_only_probability"]),
-            occlusion_sector_probability=float(sensor_parameters["occlusion_sector_probability"]),
-            occlusion_width_range_rad=tuple(sensor_parameters["occlusion_width_range_rad"]),
-            pose_xy_noise_std_m=float(sensor_parameters["pose_xy_noise_std_m"]),
-            pose_yaw_noise_std_rad=float(sensor_parameters["pose_yaw_noise_std_rad"]),
-            time_jitter_std_s=float(sensor_parameters["time_jitter_std_s"]),
-            observation_source=str(sensor_parameters["observation_source"]),
-            lidar_config=Xt16LidarConfig(
-                channels=int(lidar_parameters["channels"]),
-                vertical_angles_deg=tuple(
-                    float(value)
-                    for value in lidar_parameters["vertical_angles_deg"]
-                ),
-                points_per_frame=int(lidar_parameters["points_per_frame"]),
-                horizontal_resolution_deg=float(
-                    lidar_parameters["horizontal_resolution_deg"]
-                ),
-                maximum_interpolation_range_difference_m=float(
-                    lidar_parameters[
-                        "maximum_interpolation_range_difference_m"
-                    ]
-                ),
-                minimum_range_m=float(lidar_parameters["minimum_range_m"]),
-                maximum_range_m=float(lidar_parameters["maximum_range_m"]),
-                ray_step_m=float(lidar_parameters["ray_step_m"]),
-                mount_height_m=float(lidar_parameters["mount_height_m"]),
-                scan_frequency_hz=float(lidar_parameters["scan_frequency_hz"]),
-                motion_distortion=bool(lidar_parameters["motion_distortion"]),
-                ray_chunk_size=int(lidar_parameters["ray_chunk_size"]),
-                range_noise_std_m=float(sensor_parameters["range_noise_std_m"]),
-                height_noise_std_m=float(sensor_parameters["height_noise_std_m"]),
-                pose_xy_noise_std_m=float(sensor_parameters["pose_xy_noise_std_m"]),
-                pose_yaw_noise_std_rad=float(
-                    sensor_parameters["pose_yaw_noise_std_rad"]
-                ),
-                time_jitter_std_s=float(sensor_parameters["time_jitter_std_s"]),
-                beam_dropout_probability=float(
-                    sensor_parameters["random_missing_probability"]
-                ),
-                return_dropout_probability=float(
-                    sensor_parameters["ray_only_probability"]
-                ),
-                projection_config=PointCloudProjectionConfig(
-                    input_crop_length_x_m=float(
-                        projection_parameters["input_crop_length_x_m"]
-                    ),
-                    input_crop_length_y_m=float(
-                        projection_parameters["input_crop_length_y_m"]
-                    ),
-                    body_height_m=float(
-                        projection_parameters["body_height_m"]
-                    ),
-                    vertical_min_offset_m=float(
-                        projection_parameters["vertical_min_offset_m"]
-                    ),
-                    vertical_max_offset_m=float(
-                        projection_parameters["vertical_max_offset_m"]
-                    ),
-                    ground_percentile=float(
-                        projection_parameters["ground_percentile"]
-                    ),
-                    span_lower_percentile=float(
-                        projection_parameters["span_lower_percentile"]
-                    ),
-                    span_upper_percentile=float(
-                        projection_parameters["span_upper_percentile"]
-                    ),
-                    minimum_points_per_cell=int(
-                        projection_parameters["minimum_points_per_cell"]
-                    ),
-                    height_quantization_m=float(
-                        projection_parameters["height_quantization_m"]
-                    ),
-                    maximum_ground_deviation_m=float(
-                        projection_parameters["maximum_ground_deviation_m"]
-                    ),
-                    fusion_span_percentile=float(
-                        projection_parameters["fusion_span_percentile"]
-                    ),
-                ),
-            ),
             enabled_terrain_names=tuple(terrain_parameters["enabled_types"]),
             ramp_slope_range=tuple(terrain_parameters["ramp_slope_range"]),
             step_height_range_m=tuple(terrain_parameters["step_height_range_m"]),
@@ -270,10 +189,89 @@ class TerrainNavigationEnv(DirectRLEnv):
             ),
             friction_range=tuple(terrain_parameters["friction_range"]),
         )
-        self.map_generator = SimulatedLocalMap(self.num_envs, self.device, map_cfg)
+        self.terrain_truth = TerrainTruthModel(self.num_envs, self.device, truth_cfg)
+        projection_cfg = PointCloudProjectionConfig(
+            input_crop_length_x_m=float(
+                projection_parameters["input_crop_length_x_m"]
+            ),
+            input_crop_length_y_m=float(
+                projection_parameters["input_crop_length_y_m"]
+            ),
+            body_height_m=float(projection_parameters["body_height_m"]),
+            vertical_min_offset_m=float(
+                projection_parameters["vertical_min_offset_m"]
+            ),
+            vertical_max_offset_m=float(
+                projection_parameters["vertical_max_offset_m"]
+            ),
+            ground_percentile=float(
+                projection_parameters["ground_percentile"]
+            ),
+            span_lower_percentile=float(
+                projection_parameters["span_lower_percentile"]
+            ),
+            span_upper_percentile=float(
+                projection_parameters["span_upper_percentile"]
+            ),
+            minimum_points_per_cell=int(
+                projection_parameters["minimum_points_per_cell"]
+            ),
+            height_quantization_m=float(
+                projection_parameters["height_quantization_m"]
+            ),
+            maximum_ground_deviation_m=float(
+                projection_parameters["maximum_ground_deviation_m"]
+            ),
+            fusion_span_percentile=float(
+                projection_parameters["fusion_span_percentile"]
+            ),
+        )
+        self.lidar_mapper = IsaacRaycastLidarMapper(
+            self.num_envs,
+            self.device,
+            IsaacRaycastLidarConfig(
+                channels=int(lidar_parameters["channels"]),
+                vertical_angles_deg=tuple(
+                    float(value)
+                    for value in lidar_parameters["vertical_angles_deg"]
+                ),
+                points_per_frame=int(lidar_parameters["points_per_frame"]),
+                minimum_range_m=float(lidar_parameters["minimum_range_m"]),
+                maximum_range_m=float(lidar_parameters["maximum_range_m"]),
+                range_noise_std_m=float(sensor_parameters["range_noise_std_m"]),
+                height_noise_std_m=float(sensor_parameters["height_noise_std_m"]),
+                pose_xy_noise_std_m=float(sensor_parameters["pose_xy_noise_std_m"]),
+                pose_yaw_noise_std_rad=float(
+                    sensor_parameters["pose_yaw_noise_std_rad"]
+                ),
+                beam_dropout_probability=float(
+                    sensor_parameters["beam_dropout_probability"]
+                ),
+                return_dropout_probability=float(
+                    sensor_parameters["return_dropout_probability"]
+                ),
+                projection_config=projection_cfg,
+            ),
+        )
+        if self.lidar_sensor.num_rays != self.lidar_mapper.cfg.points_per_frame:
+            raise RuntimeError(
+                "Isaac RayCaster射线数量与points_per_frame不一致："
+                f"{self.lidar_sensor.num_rays} != "
+                f"{self.lidar_mapper.cfg.points_per_frame}"
+            )
+        self.terrain_bank_metadata = {
+            name: torch.as_tensor(value, device=self.device)
+            for name, value in self.scene.terrain.bank_metadata.items()
+        }
+        self.terrain_bank_levels = int(
+            self.scene.terrain.terrain_origins.shape[0]
+        )
+        self.terrain_variants_per_type = int(
+            terrain_parameters["mesh_variants_per_type"]
+        )
         print(
-            "[INFO] Local map observation source: "
-            f"{self.map_generator.cfg.observation_source}",
+            "[INFO] Local map observation source: Isaac Lab RayCaster Warp mesh "
+            f"backend with authoritative poses ({self.lidar_sensor.num_rays} independent rays)",
             flush=True,
         )
         self.temporal_buffer = TemporalGridBuffer(
@@ -453,13 +451,107 @@ class TerrainNavigationEnv(DirectRLEnv):
         )
 
     def _setup_scene(self) -> None:
-        self.proxy_robot = RigidObject(self.cfg.proxy_robot)
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=["/World/ground"])
-        self.scene.rigid_objects["robot"] = self.proxy_robot
+        self.proxy_robot = self.scene.extras["robot"]
+        self.lidar_sensor = self.scene.sensors["lidar"]
         light_cfg = sim_utils.DomeLightCfg(intensity=1800.0, color=(0.8, 0.8, 0.8))
         light_cfg.func("/World/Light", light_cfg)
+
+    def _assign_physical_terrain(
+        self,
+        env_ids: torch.Tensor,
+        requested_difficulty: torch.Tensor,
+    ) -> None:
+        """Select a static mesh tile and synchronize the analytic truth model."""
+        env_ids = torch.as_tensor(
+            env_ids, dtype=torch.long, device=self.device
+        ).reshape(-1)
+        requested_difficulty = torch.as_tensor(
+            requested_difficulty, dtype=torch.float32, device=self.device
+        )
+        if requested_difficulty.shape != (env_ids.numel(),):
+            raise ValueError("地形难度必须与env_ids等长")
+        levels = torch.round(
+            requested_difficulty.clamp(0.0, 1.0)
+            * float(self.terrain_bank_levels - 1)
+        ).long()
+        variants = torch.randint(
+            self.terrain_variants_per_type,
+            (env_ids.numel(),),
+            device=self.device,
+        )
+        columns = (
+            self.terrain_truth.terrain_type[env_ids]
+            * self.terrain_variants_per_type
+            + variants
+        )
+        selected_origins = self.scene.terrain.terrain_origins[levels, columns]
+        self.scene.terrain.env_origins[env_ids] = selected_origins
+        if hasattr(self.scene.terrain, "terrain_levels"):
+            self.scene.terrain.terrain_levels[env_ids] = levels
+        if hasattr(self.scene.terrain, "terrain_types"):
+            self.scene.terrain.terrain_types[env_ids] = columns
+        parameters = {
+            name: values[levels, columns]
+            for name, values in self.terrain_bank_metadata.items()
+        }
+        self.terrain_truth.apply_physical_geometry(env_ids, parameters)
+
+    def _generate_lidar_map(self, env_ids: torch.Tensor | None = None):
+        """Ray-cast the physical terrain mesh and project hits into the local map."""
+        if env_ids is None:
+            env_ids = self._all_env_ids
+        else:
+            env_ids = torch.as_tensor(
+                env_ids, dtype=torch.long, device=self.device
+            ).reshape(-1)
+        ground_reference_z = self.terrain_truth.ground_reference(
+            self.pose[env_ids], env_ids
+        )
+        origins = self.scene.env_origins[env_ids]
+        robot_world_position = torch.zeros(
+            (env_ids.numel(), 3), dtype=torch.float32, device=self.device
+        )
+        robot_world_position[:, :2] = self.pose[env_ids, :2] + origins[:, :2]
+        robot_world_position[:, 2] = (
+            origins[:, 2] + ground_reference_z + 0.20
+        )
+        ray_starts_world, ray_directions_world = transform_lidar_rays_to_world(
+            self.lidar_sensor.ray_starts[env_ids],
+            self.lidar_sensor.ray_directions[env_ids],
+            robot_world_position,
+            self.pose[env_ids, 2],
+        )
+        mesh_prim_path = self.lidar_sensor.cfg.mesh_prim_paths[0]
+        ray_hits_world = raycast_mesh(
+            ray_starts_world,
+            ray_directions_world,
+            max_dist=float(self.lidar_sensor.cfg.max_distance),
+            mesh=self.lidar_sensor.meshes[mesh_prim_path],
+        )[0]
+        # All XT16 beams have the same local start.  Keep the explicit batch
+        # origin expected by the point-cloud corruption/projection pipeline.
+        sensor_origins_world = ray_starts_world[:, 0]
+        raw_map = self.lidar_mapper.project(
+            ray_hits_world,
+            sensor_origins_world,
+            robot_world_position,
+            self.pose[env_ids, 2],
+            origins[:, 2] + ground_reference_z,
+            self.terrain_truth.domain_randomization_scale[env_ids],
+            extent_m=self.terrain_truth.cfg.extent_m,
+            size=self.terrain_truth.cfg.size,
+            maximum_relative_height_m=(
+                self.terrain_truth.cfg.maximum_relative_height_m
+            ),
+            maximum_height_range_m=(
+                self.terrain_truth.cfg.maximum_height_range_m
+            ),
+            ground_fill_value=self.terrain_truth.cfg.ground_fill_value,
+            range_fill_value=self.terrain_truth.cfg.range_fill_value,
+            normalize_heights=self.terrain_truth.cfg.normalize_heights,
+            env_ids=env_ids,
+        )
+        return downsample_map_tensor(raw_map, self.cfg.map_size), ground_reference_z
 
     """接收网络动作"""
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -485,7 +577,7 @@ class TerrainNavigationEnv(DirectRLEnv):
 
     """ 执行运动 """
     def _apply_action(self) -> None:
-        terrain_metrics = self.map_generator.true_motion_metrics(
+        terrain_metrics = self.terrain_truth.true_motion_metrics(
             self.pose, self.current_command[:, 0]
         )
         self.true_height_range_m.copy_(terrain_metrics.hazard_height_m)
@@ -498,22 +590,22 @@ class TerrainNavigationEnv(DirectRLEnv):
         )
         effective_entry_alignment = effective_terrain_entry_alignment(
             terrain_metrics.entry_alignment,
-            self.map_generator.terrain_type,
+            self.terrain_truth.terrain_type,
         )
         blocked = (
             (terrain_metrics.maximum_discontinuity_m >= self.stuck_height_range_min_m)
             & (terrain_metrics.maximum_discontinuity_m < self.cfg.collision_height_range_m)
             & (effective_entry_alignment < self.poor_entry_alignment_threshold)
-            & (self.map_generator.friction < self.stuck_friction_threshold)
+            & (self.terrain_truth.friction < self.stuck_friction_threshold)
         )
         velocity = self.execution_model.step(
             self.current_command,
             self.terrain_risk,
-            self.map_generator.friction,
+            self.terrain_truth.friction,
             self.physics_dt,
             effective_entry_alignment,
             blocked,
-            self.map_generator.domain_randomization_scale,
+            self.terrain_truth.domain_randomization_scale,
         )
         yaw = self.pose[:, 2]
         dx = velocity[:, 0] * torch.cos(yaw) * self.physics_dt
@@ -536,29 +628,29 @@ class TerrainNavigationEnv(DirectRLEnv):
             ).reshape(-1)
         position = torch.zeros((env_ids.numel(), 3), device=self.device)
         position[:, :2] = self.pose[env_ids, :2] + self.scene.env_origins[env_ids, :2]
-        position[:, 2] = 0.20
+        supporting_ground = self.terrain_truth.ground_reference(
+            self.pose[env_ids], env_ids
+        )
+        position[:, 2] = (
+            self.scene.env_origins[env_ids, 2]
+            + supporting_ground
+            + 0.20
+        )
         yaw = self.pose[env_ids, 2]
         quaternion = torch.zeros((env_ids.numel(), 4), device=self.device)
         quaternion[:, 0] = torch.cos(0.5 * yaw)
         quaternion[:, 3] = torch.sin(0.5 * yaw)
-        proxy_pose = torch.cat((position, quaternion), dim=-1).contiguous()
-        require_finite(proxy_pose, "proxy_robot位姿")
-        if write_all:
-            self.proxy_robot.write_root_pose_to_sim(proxy_pose)
-        else:
-            self.proxy_robot.write_root_pose_to_sim(
-                proxy_pose,
-                env_ids=env_ids,
-            )
+        require_finite(position, "proxy_robot位置")
+        require_finite(quaternion, "proxy_robot姿态")
+        self.proxy_robot.set_world_poses(
+            positions=position,
+            orientations=quaternion,
+            indices=None if write_all else env_ids,
+        )
 
     """更新地图与状态"""
     def _update_outcomes(self) -> None:
-        raw_map, ground_reference_z = self.map_generator.generate(
-            self.pose,
-            self.execution_model.actual_velocity,
-            return_ground_reference=True,
-        )
-        raw_map = downsample_map_tensor(raw_map, self.cfg.map_size)
+        raw_map, ground_reference_z = self._generate_lidar_map()
         self.current_ground_reference_z.copy_(ground_reference_z)
         previous_aligned_map = self.temporal_buffer.aligned_maps_to(
             self.pose,
@@ -585,15 +677,15 @@ class TerrainNavigationEnv(DirectRLEnv):
             previous_aligned_map,
             aligned_observations,
         )
-        self.observed_terrain_risk, self.unknown_ratio = self.map_generator.forward_risk(
+        self.observed_terrain_risk, self.unknown_ratio = self.terrain_truth.forward_risk(
             self.current_map, self.execution_model.actual_velocity[:, 0]
         )
-        terrain_metrics = self.map_generator.true_motion_metrics(
+        terrain_metrics = self.terrain_truth.true_motion_metrics(
             self.pose, self.execution_model.actual_velocity[:, 0]
         )
         effective_entry_alignment = effective_terrain_entry_alignment(
             terrain_metrics.entry_alignment,
-            self.map_generator.terrain_type,
+            self.terrain_truth.terrain_type,
         )
         self.true_height_range_m.copy_(terrain_metrics.hazard_height_m)
         (
@@ -624,7 +716,7 @@ class TerrainNavigationEnv(DirectRLEnv):
             torch.zeros_like(self.stuck_time),
         )
         self.current_distance = torch.linalg.vector_norm(self.goal_xy - self.pose[:, :2], dim=-1)
-        navigation_guidance = self.map_generator.navigation_guidance(
+        navigation_guidance = self.terrain_truth.navigation_guidance(
             self.pose,
             self.goal_xy,
         )
@@ -665,9 +757,11 @@ class TerrainNavigationEnv(DirectRLEnv):
             maximum_distance_m=self.cfg.maximum_distance_m,
             maximum_bad_observation_steps=self.cfg.maximum_bad_observation_steps,
         )
-        # 代理刚体只承担可视化；每个策略步写一次即可，无需在每个物理子步同步。
-        self._write_proxy_pose()
-
+        # This is a non-physical visualization Xform.  USD writes require a
+        # CUDA-to-CPU synchronization, so keep them completely out of headless
+        # training while still updating the proxy once per policy step in GUI.
+        if self.sim.has_gui():
+            self._write_proxy_pose()
     """区分是超时还是结束"""
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_outcomes()
@@ -758,10 +852,10 @@ class TerrainNavigationEnv(DirectRLEnv):
             expected_dimension=self.cfg.observation_space,
         )
         tracking_error = self.current_command - self.execution_model.actual_velocity
-        terrain_type = self.map_generator.terrain_type
+        terrain_type = self.terrain_truth.terrain_type
         half_extent = 0.5 * self.cfg.map_extent_m
-        feature_delta_x = self.map_generator.feature_x - self.pose[:, 0]
-        feature_delta_y = self.map_generator.feature_y - self.pose[:, 1]
+        feature_delta_x = self.terrain_truth.feature_x - self.pose[:, 0]
+        feature_delta_y = self.terrain_truth.feature_y - self.pose[:, 1]
         pose_cosine = torch.cos(self.pose[:, 2])
         pose_sine = torch.sin(self.pose[:, 2])
         feature_local = torch.stack(
@@ -771,7 +865,7 @@ class TerrainNavigationEnv(DirectRLEnv):
             ),
             dim=-1,
         ) / half_extent
-        relative_feature_yaw = self.map_generator.feature_yaw - self.pose[:, 2]
+        relative_feature_yaw = self.terrain_truth.feature_yaw - self.pose[:, 2]
         feature_heading = torch.stack(
             (
                 torch.sin(relative_feature_yaw),
@@ -794,16 +888,16 @@ class TerrainNavigationEnv(DirectRLEnv):
                 tracking_error / self.command_scale,
                 terrain_type[:, None].float()
                 / max(1, len(TERRAIN_NAMES) - 1),
-                self.map_generator.terrain_difficulty[:, None],
+                self.terrain_truth.terrain_difficulty[:, None],
                 (
-                    self.map_generator.amplitude
-                    / self.map_generator.cfg.maximum_height_range_m
+                    self.terrain_truth.amplitude
+                    / self.terrain_truth.cfg.maximum_height_range_m
                 )[:, None],
                 feature_local,
                 feature_heading,
-                (self.map_generator.feature_width / half_extent)[:, None],
-                (self.map_generator.barrier_half_width / half_extent)[:, None],
-                self.map_generator.friction[:, None],
+                (self.terrain_truth.feature_width / half_extent)[:, None],
+                (self.terrain_truth.barrier_half_width / half_extent)[:, None],
+                self.terrain_truth.friction[:, None],
                 self.terrain_risk[:, None],
                 self.observed_terrain_risk[:, None],
                 self.unknown_ratio[:, None],
@@ -835,7 +929,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         episode_log = None
         if completed.any():
             completed_ids = env_ids[completed]
-            completed_terrain = self.map_generator.terrain_type[completed_ids]
+            completed_terrain = self.terrain_truth.terrain_type[completed_ids]
             mastery_mask = (
                 self.current_curriculum_stage[completed_ids]
                 == self.curriculum.levels[completed_ids]
@@ -881,7 +975,7 @@ class TerrainNavigationEnv(DirectRLEnv):
                     self.current_goal_sampling_maximum_m.mean()
                 ),
                 "Curriculum/mean_domain_randomization_scale": (
-                    self.map_generator.domain_randomization_scale.mean()
+                    self.terrain_truth.domain_randomization_scale.mean()
                 ),
                 "Episode/completed_count": completed.float().sum(),
                 "Episode/final_navigation_potential": (
@@ -900,16 +994,15 @@ class TerrainNavigationEnv(DirectRLEnv):
                     self.safety_stop_steps[completed_ids].float().mean()
                 ),
             }
-            if self.map_generator.lidar_sensor is not None:
-                episode_log["Sensor/point_slots_per_frame"] = float(
-                    self.map_generator.lidar_sensor.num_rays
-                )
-                episode_log["Sensor/mean_point_count"] = (
-                    self.map_generator.lidar_sensor.last_hit_mask[completed_ids]
-                    .sum(dim=1)
-                    .float()
-                    .mean()
-                )
+            episode_log["Sensor/point_slots_per_frame"] = float(
+                self.lidar_mapper.cfg.points_per_frame
+            )
+            episode_log["Sensor/mean_point_count"] = (
+                self.lidar_mapper.last_hit_mask[completed_ids]
+                .sum(dim=1)
+                .float()
+                .mean()
+            )
             episode_log.update(
                 {
                     f"Reward/{name}": values[completed_ids].mean()
@@ -953,7 +1046,7 @@ class TerrainNavigationEnv(DirectRLEnv):
             pit_mask = completed_terrain == TERRAIN_NAMES.index("pit")
             episode_log["Terrain/pit_mean_difficulty"] = (
                 (
-                    self.map_generator.terrain_difficulty[completed_ids][pit_mask]
+                    self.terrain_truth.terrain_difficulty[completed_ids][pit_mask]
                 ).sum()
                 / pit_mask.sum().clamp(min=1)
             )
@@ -990,7 +1083,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.current_curriculum_difficulty[env_ids] = (
             task_batch.curriculum_difficulty
         )
-        self.map_generator.reset(
+        self.terrain_truth.reset(
             env_ids=env_ids,
             terrain_probabilities=task_batch.terrain_probabilities,
             terrain_difficulty=task_batch.geometry_difficulty,
@@ -998,6 +1091,9 @@ class TerrainNavigationEnv(DirectRLEnv):
                 task_batch.domain_randomization_scale
             ),
         )
+        # RayCaster只能缓存一个静态网格，因此所有地形预先合并成
+        # 一张物理地形库；每个回合通过切换env origin选择真实网格块。
+        self._assign_physical_terrain(env_ids, task_batch.geometry_difficulty)
 
         # 各阶段独立控制初始朝向难度：第一阶段近似正前方，
         # 第二阶段起可覆盖任意目标方向，楼梯阶段保持入口对齐。
@@ -1006,30 +1102,29 @@ class TerrainNavigationEnv(DirectRLEnv):
         )
         self.pose[env_ids, 2] = torch.atan2(
             torch.sin(
-                self.map_generator.route_yaw[env_ids]
+                self.terrain_truth.route_yaw[env_ids]
                 + heading_error
             ),
             torch.cos(
-                self.map_generator.route_yaw[env_ids]
+                self.terrain_truth.route_yaw[env_ids]
                 + heading_error
             ),
         )
 
         goal_sampling_maximum = task_batch.goal_maximum_m
         self.current_goal_sampling_maximum_m[env_ids] = goal_sampling_maximum
-        self.goal_xy[env_ids] = self.map_generator.sample_task_goals(
+        self.goal_xy[env_ids] = self.terrain_truth.sample_task_goals(
             self.pose[env_ids],
             task_batch.goal_minimum_m,
             goal_sampling_maximum,
             env_ids,
         )
-        generated_map, ground_reference_z = self.map_generator.generate(
-            self.pose[env_ids],
-            self.execution_model.actual_velocity[env_ids],
-            return_ground_reference=True,
-            env_ids=env_ids,
-        )
-        raw_map = downsample_map_tensor(generated_map, self.cfg.map_size)
+        # 可视化Xform与权威规划位姿同步；真实射线起点直接由该权威位姿
+        # 计算，不再通过第二个PhysX刚体视图反读相同状态。无界面训练
+        # 不写USD，避免每次reset发生GPU到CPU同步。
+        if self.sim.has_gui():
+            self._write_proxy_pose(env_ids)
+        raw_map, ground_reference_z = self._generate_lidar_map(env_ids)
         self.current_map[env_ids] = raw_map
         reset_finite_map = torch.isfinite(raw_map).flatten(1).all(dim=1)
         reset_observed_ratio = raw_map[:, 2].mean(dim=(-2, -1))
@@ -1041,10 +1136,10 @@ class TerrainNavigationEnv(DirectRLEnv):
         )
         self.safety_stop[env_ids] = ~self.map_is_healthy[env_ids]
         self.current_ground_reference_z[env_ids] = ground_reference_z
-        reset_observed_risk, reset_unknown = self.map_generator.forward_risk(
+        reset_observed_risk, reset_unknown = self.terrain_truth.forward_risk(
             self.current_map[env_ids], self.current_command[env_ids, 0]
         )
-        reset_metrics = self.map_generator.true_motion_metrics(
+        reset_metrics = self.terrain_truth.true_motion_metrics(
             self.pose[env_ids], self.current_command[env_ids, 0], env_ids
         )
         self.true_height_range_m[env_ids] = reset_metrics.hazard_height_m
@@ -1056,7 +1151,7 @@ class TerrainNavigationEnv(DirectRLEnv):
         self.current_distance[env_ids] = torch.linalg.vector_norm(
             self.goal_xy[env_ids] - self.pose[env_ids, :2], dim=-1
         )
-        reset_guidance = self.map_generator.navigation_guidance(
+        reset_guidance = self.terrain_truth.navigation_guidance(
             self.pose[env_ids],
             self.goal_xy[env_ids],
             env_ids,
@@ -1107,4 +1202,3 @@ class TerrainNavigationEnv(DirectRLEnv):
             self.current_map[env_ids],
             repeated_observation,
         )
-        self._write_proxy_pose(env_ids)

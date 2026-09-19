@@ -28,9 +28,9 @@ class Go2wActorCritic(nn.Module):
         *,
         map_channels: int = 7,
         map_size: int = 200,
-        command_history_length: int = 4,
-        motion_history_length: int = 4,
-        architecture: str = "compact_map_motion_gru_v6",
+        command_history_length: int = 8,
+        motion_history_length: int = 8,
+        architecture: str = "compact_map_motion_gru_v7",
         map_encoder_channels: list[int] | tuple[int, ...] = (32, 64, 96, 128),
         map_pool_size: int = 8,
         map_feature_dim: int = 384,
@@ -91,8 +91,8 @@ class Go2wActorCritic(nn.Module):
                 f"actual={actor_dim}, expected={expected_actor_dim}"
             )
 
-        if self.architecture != "compact_map_motion_gru_v6":
-            raise ValueError("model.architecture必须为compact_map_motion_gru_v6")
+        if self.architecture != "compact_map_motion_gru_v7":
+            raise ValueError("model.architecture必须为compact_map_motion_gru_v7")
         self.map_encoder = CompactTerrainMapEncoder(
             input_channels=self.map_channels,
             map_size=self.map_size,
@@ -144,7 +144,7 @@ class Go2wActorCritic(nn.Module):
         )
         self.register_buffer(
             "_policy_architecture_version",
-            torch.tensor(6, dtype=torch.int64),
+            torch.tensor(7, dtype=torch.int64),
         )
         self.distribution: Normal | None = None
         self._pre_tanh_action: torch.Tensor | None = None

@@ -10,28 +10,28 @@ import torch
 @dataclass
 class RewardWeights:
     # 目标趋近是最主要奖励。
-    progress: float = 8.0
+    progress: float = 10.0
     # 绕障时允许短暂横移或退让，但仍用较小代价约束无效远离。
     regression: float = -1.0
-    goal_reached: float = 20.0
+    goal_reached: float = 30.0
 
     # 轻量方向引导，避免策略只靠稀疏距离差探索。
     heading: float = 0.05
     forward_to_goal: float = 0.25
 
-    collision: float = -20.0
-    unstable: float = -15.0
+    collision: float = -60.0
+    unstable: float = -40.0
     stuck: float = -5.0
-    timeout: float = -15.0
+    timeout: float = -25.0
     out_of_bounds: float = -10.0
     observation_failure: float = -5.0
 
     # 动作变化惩罚：抑制指令抖动。
-    linear_action_rate: float = -0.02
-    angular_action_rate: float = -0.02
+    linear_action_rate: float = -0.01
+    angular_action_rate: float = -0.01
 
     # 持续转动惩罚：解决恒定角速度绕圈。
-    angular_speed: float = -0.08
+    angular_speed: float = -0.10
     spin: float = -0.25
 
     time: float = -0.01
@@ -44,7 +44,7 @@ class RewardWeights:
     # 原来的-0.10可能接近或抵消每步前进收益。
     unknown_risk: float = -0.02
     # 高风险地形上的高速运动惩罚，鼓励提前减速或绕行。
-    terrain_speed_risk: float = -0.15
+    terrain_speed_risk: float = -0.75
 
 
 def navigation_reward(

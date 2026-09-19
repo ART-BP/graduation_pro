@@ -8,9 +8,13 @@ from pathlib import Path
 
 import yaml
 
-from go2w_terrain_planner.mapping.simulated_local_map import TERRAIN_NAMES
+from go2w_terrain_planner.mapping.terrain_truth_model import TERRAIN_NAMES
 
-from .observation_layout import ACTOR_MAP_CHANNELS, policy_observation_dimension
+from .observation_layout import (
+    ACTOR_MAP_CHANNELS,
+    critic_observation_dimension,
+    policy_observation_dimension,
+)
 
 
 CONFIG_NAMES = ("observation", "action", "reward", "terrain", "sensor", "training")
@@ -199,29 +203,19 @@ def validate_project_config(config: dict) -> None:
         raise ValueError("最大活动半径必须大于局部目标最大距离")
 
     sensor_cfg = config["sensor"]
-    if sensor_cfg["observation_source"] not in {"analytic", "raycast"}:
-        raise ValueError("sensor.observation_source必须为analytic或raycast")
     for key in (
         "height_noise_std_m",
         "range_noise_std_m",
         "pose_xy_noise_std_m",
         "pose_yaw_noise_std_rad",
-        "time_jitter_std_s",
     ):
         if sensor_cfg[key] < 0.0:
             raise ValueError(f"sensor.{key}不能为负数")
-    for key in ("random_missing_probability", "ray_only_probability"):
+    for key in ("beam_dropout_probability", "return_dropout_probability"):
         if not 0.0 <= sensor_cfg[key] <= 1.0:
             raise ValueError(f"{key}必须位于[0,1]")
-    if sensor_cfg["random_missing_probability"] + sensor_cfg["ray_only_probability"] > 1.0:
-        raise ValueError("缺失率与仅射线观测率之和不能超过1")
-    if not 0.0 <= sensor_cfg["occlusion_sector_probability"] <= 1.0:
-        raise ValueError("occlusion_sector_probability必须位于[0,1]")
-    require_range(
-        sensor_cfg["occlusion_width_range_rad"],
-        "sensor.occlusion_width_range_rad",
-        minimum=0.0,
-    )
+    if sensor_cfg["beam_dropout_probability"] + sensor_cfg["return_dropout_probability"] > 1.0:
+        raise ValueError("射线丢失率与回波丢失率之和不能超过1")
     lidar_cfg = sensor_cfg["lidar"]
     if not isinstance(lidar_cfg, dict):
         raise ValueError("sensor.lidar必须为YAML映射")
@@ -245,12 +239,9 @@ def validate_project_config(config: dict) -> None:
         (
             "points_per_frame",
             "horizontal_resolution_deg",
-            "maximum_interpolation_range_difference_m",
             "maximum_range_m",
-            "ray_step_m",
             "mount_height_m",
             "scan_frequency_hz",
-            "ray_chunk_size",
         ),
         "sensor.lidar",
     )
@@ -259,12 +250,13 @@ def validate_project_config(config: dict) -> None:
         or not math.isfinite(lidar_cfg["minimum_range_m"])
         or lidar_cfg["minimum_range_m"] < 0.0
         or lidar_cfg["minimum_range_m"] >= lidar_cfg["maximum_range_m"]
-        or lidar_cfg["ray_step_m"] > lidar_cfg["maximum_range_m"]
-        or lidar_cfg["horizontal_resolution_deg"] > 20.0
         or not isinstance(lidar_cfg["points_per_frame"], int)
         or lidar_cfg["points_per_frame"] % channels != 0
-        or not isinstance(lidar_cfg["ray_chunk_size"], int)
-        or not isinstance(lidar_cfg["motion_distortion"], bool)
+        or not math.isclose(
+            lidar_cfg["horizontal_resolution_deg"],
+            360.0 / (lidar_cfg["points_per_frame"] / channels),
+            rel_tol=1.0e-6,
+        )
     ):
         raise ValueError("sensor.lidar量程、分辨率或扫描配置无效")
     projection_cfg = lidar_cfg["projection"]
@@ -286,6 +278,7 @@ def validate_project_config(config: dict) -> None:
         projection_cfg["vertical_max_offset_m"]
         <= projection_cfg["vertical_min_offset_m"]
         or not isinstance(projection_cfg["minimum_points_per_cell"], int)
+        or projection_cfg["minimum_points_per_cell"] < 2
         or not 0.0 <= projection_cfg["ground_percentile"] <= 1.0
         or not 0.0
         <= projection_cfg["span_lower_percentile"]
@@ -294,8 +287,43 @@ def validate_project_config(config: dict) -> None:
         or not 0.0 <= projection_cfg["fusion_span_percentile"] <= 1.0
     ):
         raise ValueError("sensor.lidar.projection裁剪或分位数配置无效")
+    crop_diagonal_m = math.hypot(
+        0.5 * projection_cfg["input_crop_length_x_m"],
+        0.5 * projection_cfg["input_crop_length_y_m"],
+    )
+    if (
+        projection_cfg["input_crop_length_x_m"] < map_cfg["extent_m"]
+        or projection_cfg["input_crop_length_y_m"] < map_cfg["extent_m"]
+        or lidar_cfg["maximum_range_m"] < crop_diagonal_m
+    ):
+        raise ValueError("点云裁剪范围、局部地图尺寸与激光射程不一致")
 
     terrain_cfg = config["terrain"]
+    require_positive(
+        terrain_cfg,
+        (
+            "mesh_bank_levels",
+            "mesh_variants_per_type",
+            "mesh_tile_size_m",
+            "mesh_surface_resolution_m",
+        ),
+        "terrain",
+    )
+    minimum_tile_size_m = 2.0 * (
+        termination_cfg["maximum_distance_from_origin_m"]
+        + lidar_cfg["maximum_range_m"]
+    )
+    if (
+        not isinstance(terrain_cfg["mesh_bank_levels"], int)
+        or terrain_cfg["mesh_bank_levels"] < 2
+        or not isinstance(terrain_cfg["mesh_variants_per_type"], int)
+        or terrain_cfg["mesh_variants_per_type"] < 4
+        or terrain_cfg["mesh_tile_size_m"] <= minimum_tile_size_m
+    ):
+        raise ValueError(
+            "物理地形库等级、变体或地形块尺寸无效；地形块必须覆盖"
+            "最大活动半径与完整激光射程"
+        )
     for key in (
         "ramp_slope_range",
         "step_height_range_m",
@@ -309,6 +337,8 @@ def validate_project_config(config: dict) -> None:
         "friction_range",
     ):
         require_range(terrain_cfg[key], f"terrain.{key}", minimum=0.0)
+    if terrain_cfg["friction_range"][1] > 1.0:
+        raise ValueError("terrain.friction_range上限不能超过执行模型的1.0截断值")
     if not terrain_cfg["enabled_types"]:
         raise ValueError("terrain.enabled_types不能为空")
     if len(set(terrain_cfg["enabled_types"])) != len(terrain_cfg["enabled_types"]):
@@ -501,10 +531,12 @@ def validate_project_config(config: dict) -> None:
         raise ValueError("ppo.gamma与ppo.lam必须位于(0,1]")
     if ppo_cfg["entropy_coef"] < 0.0:
         raise ValueError("ppo.entropy_coef不能为负数")
+    if ppo_cfg.get("schedule") not in ("fixed", "adaptive"):
+        raise ValueError("ppo.schedule必须为fixed或adaptive")
 
     model_cfg = config["model"]
-    if model_cfg.get("architecture") != "compact_map_motion_gru_v6":
-        raise ValueError("model.architecture必须为compact_map_motion_gru_v6")
+    if model_cfg.get("architecture") != "compact_map_motion_gru_v7":
+        raise ValueError("model.architecture必须为compact_map_motion_gru_v7")
     require_positive(
         model_cfg,
         (
@@ -531,7 +563,7 @@ def validate_project_config(config: dict) -> None:
         raise ValueError("model.map_encoder_channels必须包含四个正整数")
     if model_cfg["map_encoder_channels"][-1] % 4 != 0:
         raise ValueError(
-            "compact_map_motion_gru_v6最后一级通道数必须为4的倍数"
+            "compact_map_motion_gru_v7最后一级通道数必须为4的倍数"
         )
     if not (
         model_cfg["minimum_action_std"]
@@ -555,6 +587,9 @@ def apply_environment_config(env_cfg, config: dict, config_directory: str | Path
     termination_cfg = config["termination"]
     curriculum_cfg = config["curriculum"]
     training_cfg = config["training"]
+    sensor_cfg = config["sensor"]
+    lidar_cfg = sensor_cfg["lidar"]
+    terrain_cfg = config["terrain"]
 
     env_cfg.map_extent_m = float(map_cfg["extent_m"])
     env_cfg.map_size = int(map_cfg["output_size"])
@@ -570,6 +605,10 @@ def apply_environment_config(env_cfg, config: dict, config_directory: str | Path
         command_history_length=env_cfg.command_history_length,
         motion_history_length=env_cfg.motion_history_length,
     )
+    env_cfg.state_space = critic_observation_dimension(
+        command_history_length=env_cfg.command_history_length,
+        motion_history_length=env_cfg.motion_history_length,
+    )
     env_cfg.local_goal_minimum_m = float(goal_cfg["minimum_distance_m"])
     env_cfg.local_goal_maximum_m = float(goal_cfg["maximum_distance_m"])
     env_cfg.goal_tolerance_m = float(termination_cfg["goal_tolerance_m"])
@@ -582,6 +621,58 @@ def apply_environment_config(env_cfg, config: dict, config_directory: str | Path
     env_cfg.stuck_timeout_s = float(termination_cfg["stuck_timeout_s"])
     env_cfg.maximum_bad_observation_steps = int(termination_cfg["maximum_bad_observation_steps"])
     env_cfg.curriculum_maximum_stage = int(curriculum_cfg["maximum_level"])
+    env_cfg.scene.lidar.update_period = 1.0 / float(
+        lidar_cfg["scan_frequency_hz"]
+    )
+    environment_step_s = float(env_cfg.sim.dt) * int(env_cfg.decimation)
+    if not math.isclose(
+        env_cfg.scene.lidar.update_period,
+        environment_step_s,
+        rel_tol=1.0e-6,
+        abs_tol=1.0e-9,
+    ):
+        raise ValueError(
+            "当前地图管线每个环境决策步生成一帧点云，因此"
+            "sensor.lidar.scan_frequency_hz必须等于1/(sim.dt*decimation)"
+        )
+    env_cfg.scene.lidar.max_distance = float(lidar_cfg["maximum_range_m"])
+    env_cfg.scene.lidar.offset.pos = (
+        0.0,
+        0.0,
+        float(lidar_cfg["mount_height_m"]) - 0.20,
+    )
+    env_cfg.scene.lidar.pattern_cfg.vertical_angles_deg = tuple(
+        float(value) for value in lidar_cfg["vertical_angles_deg"]
+    )
+    env_cfg.scene.lidar.pattern_cfg.horizontal_resolution_deg = float(
+        lidar_cfg["horizontal_resolution_deg"]
+    )
+
+    bank_cfg = env_cfg.scene.terrain.terrain_generator
+    bank_cfg.num_rows = int(terrain_cfg["mesh_bank_levels"])
+    bank_cfg.variants_per_type = int(terrain_cfg["mesh_variants_per_type"])
+    bank_cfg.num_cols = len(TERRAIN_NAMES) * bank_cfg.variants_per_type
+    tile_size = float(terrain_cfg["mesh_tile_size_m"])
+    bank_cfg.size = (tile_size, tile_size)
+    bank_cfg.surface_resolution_m = float(
+        terrain_cfg["mesh_surface_resolution_m"]
+    )
+    for name in (
+        "ramp_slope_range",
+        "step_height_range_m",
+        "step_width_range_m",
+        "rough_amplitude_range_m",
+        "pit_depth_range_m",
+        "pit_half_width_range_m",
+        "obstacle_height_range_m",
+        "low_obstacle_height_range_m",
+        "barrier_half_width_range_m",
+    ):
+        setattr(bank_cfg, name, tuple(float(value) for value in terrain_cfg[name]))
+    bank_cfg.challenge_barrier_width_scale = float(
+        terrain_cfg["challenge_barrier_width_scale"]
+    )
+    env_cfg.scene.env_spacing = tile_size
     if config_directory is not None:
         env_cfg.project_config_directory = str(Path(config_directory).resolve())
 

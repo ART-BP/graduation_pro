@@ -18,9 +18,9 @@ class Go2wActorCriticCfg(RslRlPpoActorCriticCfg):
     activation = "elu"
     map_channels = 7
     map_size = 200
-    command_history_length = 4
-    motion_history_length = 4
-    architecture = "compact_map_motion_gru_v6"
+    command_history_length = 8
+    motion_history_length = 8
+    architecture = "compact_map_motion_gru_v7"
     map_encoder_channels = [32, 64, 96, 128]
     map_pool_size = 8
     map_feature_dim = 384
@@ -37,9 +37,9 @@ class Go2wPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """整个训练运行器配置"""
     num_steps_per_env = 96
     max_iterations = 10000
-    save_interval = 500
+    save_interval = 200
     experiment_name = "go2w_terrain_navigation"
-    run_name = "phase12_nine_stage_curriculum"
+    run_name = "phase13_raycast_reward_diversity"
     device = "cuda:0"
     seed = 42
     obs_groups = {"policy": ["policy"], "critic": ["critic"]}
@@ -52,7 +52,7 @@ class Go2wPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=3,
         num_mini_batches=8,
         learning_rate=5.0e-5,
-        schedule="fixed",
+        schedule="adaptive",
         gamma=0.997,
         lam=0.98,
         desired_kl=0.01,

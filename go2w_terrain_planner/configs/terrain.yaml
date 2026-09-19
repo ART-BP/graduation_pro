@@ -1,5 +1,14 @@
 terrain:
   enabled_types: [flat, ramp, step, stairs, rough, pit, wall, pillar, mixed, multi_route, low_obstacle]
+  # RayCaster只支持静态Mesh，因此预生成难度×类型×变体的物理地形库。
+  # 17级降低连续课程映射到静态物理网格时的高度/坡度离散跳变。
+  mesh_bank_levels: 17
+  # 每类8种前向距离、横向偏置、宽度和通行方向组合，抑制场景记忆。
+  mesh_variants_per_type: 8
+  # 半边长28 m，大于15 m活动半径与12 m射程之和，并保留1 m裕量。
+  mesh_tile_size_m: 56.0
+  # 与局部地图0.05 m分辨率一致，主要影响有限尺寸的rough曲面块。
+  mesh_surface_resolution_m: 0.05
   ramp_slope_range: [0.05, 0.40]
   step_height_range_m: [0.05, 0.35]
   step_width_range_m: [0.25, 0.60]
@@ -22,7 +31,8 @@ terrain:
   challenge_barrier_width_scale: 0.55
   # 障碍感知奖励绕行端点相对墙端的安全余量。
   barrier_navigation_clearance_m: 0.35
-  friction_range: [0.35, 1.20]
+  # 执行模型将摩擦系数截断到1.0，因此不配置无效的>1区间。
+  friction_range: [0.35, 1.00]
 curriculum:
   # 能力阶段与地形枚举彻底解耦，从基本趋近开始按九阶段单调解锁。
   initial_level: 1

@@ -21,8 +21,8 @@ def test_project_configuration_is_consistent() -> None:
     assert config["map"]["max_abs_relative_height_m"] == 1.0
     assert config["map"]["actor_channels"] == 7
     assert config["map"]["observation_fusion_length"] == 12
-    assert config["history"]["command_length"] == 4
-    assert config["history"]["motion_length"] == 4
+    assert config["history"]["command_length"] == 8
+    assert config["history"]["motion_length"] == 8
     assert config["goal"]["minimum_distance_m"] == 0.0
     assert config["goal"]["maximum_distance_m"] == 10.0
     assert config["curriculum"]["minimum_level"] == 1
@@ -33,14 +33,14 @@ def test_project_configuration_is_consistent() -> None:
     assert config["model"]["minimum_action_std"] == 0.08
     assert config["model"]["maximum_action_std"] == 0.6
     assert config["model"]["maximum_pre_tanh_mean"] == 1.5
-    assert config["model"]["architecture"] == "compact_map_motion_gru_v6"
+    assert config["model"]["architecture"] == "compact_map_motion_gru_v7"
     assert config["model"]["map_encoder_channels"] == [32, 64, 96, 128]
     assert config["model"]["map_pool_size"] == 8
     assert config["model"]["map_feature_dim"] == 384
     assert config["model"]["motion_gru_hidden_dim"] == 128
     assert config["model"]["fusion_hidden_dim"] == 384
     assert config["ppo"]["entropy_coef"] == 0.001
-    assert config["ppo"]["schedule"] == "fixed"
+    assert config["ppo"]["schedule"] == "adaptive"
     assert config["curriculum"]["frontier_sampling_probability"] == 0.60
     assert config["curriculum"]["challenge_sampling_probability"] == 0.05
     assert config["curriculum"]["allow_level_demotion"] is False
@@ -52,14 +52,21 @@ def test_project_configuration_is_consistent() -> None:
     assert config["terrain"]["pit_half_width_range_m"] == [0.25, 0.60]
     assert config["terrain"]["pit_curriculum_start_depth_max_m"] == 0.12
     assert config["terrain"]["barrier_navigation_clearance_m"] == 0.35
+    assert config["terrain"]["mesh_bank_levels"] == 17
+    assert config["terrain"]["mesh_variants_per_type"] == 8
+    assert config["terrain"]["mesh_tile_size_m"] == 56.0
+    assert config["terrain"]["friction_range"] == [0.35, 1.0]
     assert config["runner"]["num_steps_per_env"] == 96
     assert config["ppo"]["num_learning_epochs"] == 3
     assert config["ppo"]["value_loss_coef"] == 0.5
-    assert config["sensor"]["observation_source"] == "raycast"
     assert config["sensor"]["lidar"]["channels"] == 16
     assert config["sensor"]["lidar"]["points_per_frame"] == 32000
+    assert config["sensor"]["lidar"]["horizontal_resolution_deg"] == 0.18
+    assert config["sensor"]["lidar"]["maximum_range_m"] == 12.0
     assert len(config["sensor"]["lidar"]["vertical_angles_deg"]) == 16
     assert config["sensor"]["lidar"]["projection"]["ground_percentile"] == 0.10
+    assert config["sensor"]["lidar"]["projection"]["minimum_points_per_cell"] == 2
+    assert config["sensor"]["lidar"]["projection"]["maximum_ground_deviation_m"] == 0.06
 
 
 def test_invalid_training_and_reward_values_are_rejected() -> None:
@@ -139,6 +146,23 @@ def test_invalid_training_and_reward_values_are_rejected() -> None:
     with pytest.raises(ValueError, match="扫描配置"):
         validate_project_config(invalid_point_count)
 
+    invalid_projection_support = deepcopy(config)
+    invalid_projection_support["sensor"]["lidar"]["projection"][
+        "minimum_points_per_cell"
+    ] = 1
+    with pytest.raises(ValueError, match="裁剪或分位数"):
+        validate_project_config(invalid_projection_support)
+
+    invalid_tile_size = deepcopy(config)
+    invalid_tile_size["terrain"]["mesh_tile_size_m"] = 54.0
+    with pytest.raises(ValueError, match="完整激光射程"):
+        validate_project_config(invalid_tile_size)
+
+    invalid_friction = deepcopy(config)
+    invalid_friction["terrain"]["friction_range"] = [0.35, 1.2]
+    with pytest.raises(ValueError, match="1.0截断值"):
+        validate_project_config(invalid_friction)
+
 
 def test_incomplete_sensor_config_is_rejected(tmp_path: Path) -> None:
     config_dir = Path(__file__).resolve().parents[2] / "configs"
@@ -146,7 +170,6 @@ def test_incomplete_sensor_config_is_rejected(tmp_path: Path) -> None:
         shutil.copy2(source, tmp_path / source.name)
     sensor_path = tmp_path / "sensor.yaml"
     sensor_document = yaml.safe_load(sensor_path.read_text(encoding="utf-8"))
-    sensor_document["sensor"].pop("observation_source")
     sensor_document["sensor"].pop("lidar")
     sensor_path.write_text(
         yaml.safe_dump(sensor_document, sort_keys=False),

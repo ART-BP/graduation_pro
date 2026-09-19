@@ -22,6 +22,6 @@ goal:
   minimum_distance_m: 0.0
   maximum_distance_m: 10.0
 history:
-  # 指令与运动序列等长，由GRU按时间顺序编码。
-  command_length: 4
-  motion_length: 4
+  # 0.1 s决策周期下覆盖0.8 s，兼顾速度滞后识别与输入规模。
+  command_length: 8
+  motion_length: 8

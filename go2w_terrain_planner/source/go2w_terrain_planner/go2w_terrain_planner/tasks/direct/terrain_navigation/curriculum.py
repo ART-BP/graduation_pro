@@ -51,6 +51,9 @@ class CurriculumStageSchedule:
         self.geometry_difficulty_range = torch.zeros(
             (count, 2), device=self.device
         )
+        self.has_progressive_difficulty = torch.zeros(
+            count, dtype=torch.bool, device=self.device
+        )
         self.stage_names: dict[int, str] = {}
 
         terrain_to_index = {
@@ -77,6 +80,10 @@ class CurriculumStageSchedule:
                 dtype=torch.float32,
                 device=self.device,
             )
+            geometry_range = self.geometry_difficulty_range[stage]
+            self.has_progressive_difficulty[stage] = (
+                (geometry_range[1] - geometry_range[0]).abs() > 1.0e-6
+            ) | (self.domain_randomization_scale[stage] > 1.0e-6)
 
     def sample(
         self,
@@ -198,6 +205,14 @@ class CurriculumStageSchedule:
                     torch.zeros_like(frontier_difficulty),
                 ),
             )
+        # Stages such as flat-forward and flat-random-goal have no geometry or
+        # randomization axis to ramp. They are full-difficulty tasks from the
+        # first episode and should not wait for a meaningless synthetic gate.
+        curriculum_difficulty = torch.where(
+            self.has_progressive_difficulty[stages],
+            curriculum_difficulty,
+            torch.ones_like(curriculum_difficulty),
+        )
         geometry_bounds = self.geometry_difficulty_range[stages]
         geometry_difficulty = geometry_bounds[:, 0] + curriculum_difficulty * (
             geometry_bounds[:, 1] - geometry_bounds[:, 0]

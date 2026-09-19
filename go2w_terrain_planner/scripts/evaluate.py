@@ -53,7 +53,7 @@ from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
 import go2w_terrain_planner.tasks  # noqa: F401
 from go2w_terrain_planner.models import Go2wActorCritic
-from go2w_terrain_planner.mapping.simulated_local_map import TERRAIN_NAMES
+from go2w_terrain_planner.mapping.terrain_truth_model import TERRAIN_NAMES
 from go2w_terrain_planner.utils.config_loader import (
     apply_project_config,
     apply_curriculum_stage_sampling_range,
@@ -98,7 +98,7 @@ def main() -> None:
     validate_checkpoint(
         checkpoint,
         include_optimizer=False,
-        required_policy_architecture_version=6,
+        required_policy_architecture_version=7,
     )
 
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -136,7 +136,7 @@ def main() -> None:
     stage_episode_counts = torch.zeros_like(stage_step_counts)
     stage_success_counts = torch.zeros_like(stage_step_counts)
     stage_names = dict(env.unwrapped.curriculum_schedule.stage_names)
-    active_terrain = env.unwrapped.map_generator.terrain_type.clone()
+    active_terrain = env.unwrapped.terrain_truth.terrain_type.clone()
     active_stage = env.unwrapped.current_curriculum_stage.clone()
     started = time.perf_counter()
     with torch.inference_mode():
@@ -195,7 +195,7 @@ def main() -> None:
                     stage_success_counts[stage] += int(
                         round(float(success_count))
                     )
-            active_terrain.copy_(env.unwrapped.map_generator.terrain_type)
+            active_terrain.copy_(env.unwrapped.terrain_truth.terrain_type)
             active_stage.copy_(env.unwrapped.current_curriculum_stage)
     elapsed = time.perf_counter() - started
     env.close()

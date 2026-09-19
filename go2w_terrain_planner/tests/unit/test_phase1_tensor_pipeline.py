@@ -4,9 +4,9 @@ torch = pytest.importorskip("torch")
 
 from go2w_terrain_planner.mapping.coordinate_transform import encode_local_goal
 from go2w_terrain_planner.mapping.grid_preprocessor import downsample_map_tensor
-from go2w_terrain_planner.mapping.simulated_local_map import (
-    SimulatedLocalMap,
-    SimulatedMapConfig,
+from go2w_terrain_planner.mapping.terrain_truth_model import (
+    TerrainTruthModel,
+    TerrainTruthConfig,
     fuse_aligned_map_history,
 )
 from go2w_terrain_planner.mapping.temporal_grid_buffer import TemporalGridBuffer
@@ -20,20 +20,13 @@ from go2w_terrain_planner.tasks.direct.terrain_navigation.observations import (
 def test_phase1_tensor_pipeline_contract() -> None:
     batch, source_size, output_size, history = 2, 32, 16, 5
     height_scale = 1.5
-    generator = SimulatedLocalMap(
+    generator = TerrainTruthModel(
         batch,
         "cpu",
-        SimulatedMapConfig(
+        TerrainTruthConfig(
             size=source_size,
             maximum_relative_height_m=height_scale,
             enabled_terrain_names=("step",),
-            height_noise_std_m=0.0,
-            range_noise_std_m=0.0,
-            missing_probability=0.0,
-            ray_only_probability=0.0,
-            occlusion_sector_probability=0.0,
-            pose_xy_noise_std_m=0.0,
-            pose_yaw_noise_std_rad=0.0,
         ),
     )
     env_ids = torch.arange(batch)
@@ -42,9 +35,12 @@ def test_phase1_tensor_pipeline_contract() -> None:
     goals = generator.sample_task_goals(pose, 2.0, 3.0, env_ids)
     pose[:, 2] = generator.route_yaw
     velocity = torch.tensor([[0.2, 0.0], [0.3, 0.1]])
-    raw_map, reference = generator.generate(
-        pose, velocity, return_ground_reference=True
-    )
+    # The environment supplies this tensor from native RayCaster returns. This
+    # pipeline test starts at that explicit sensor/map boundary.
+    raw_map = torch.zeros((batch, 4, source_size, source_size))
+    raw_map[:, 2:] = 1.0
+    raw_map[:, 1, source_size // 2 :, :] = 0.1
+    reference = generator.ground_reference(pose)
     local_map = downsample_map_tensor(raw_map, output_size)
 
     fusion = TemporalGridBuffer(

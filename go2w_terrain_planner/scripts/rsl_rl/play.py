@@ -156,7 +156,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     validate_checkpoint(
         resume_path,
         include_optimizer=False,
-        required_policy_architecture_version=6,
+        required_policy_architecture_version=7,
     )
 
     log_dir = os.path.dirname(resume_path)
