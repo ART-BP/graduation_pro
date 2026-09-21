@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class CurriculumTaskBatch:
-    """Per-environment tasks sampled from the shared capability frontier."""
+    """ 保存一次采样得到的批次任务参数（阶段索引、地形概率、难度、目标距离范围、朝向范围、随机化规模等）"""
 
     stages: object
     terrain_probabilities: object
@@ -20,11 +20,9 @@ class CurriculumTaskBatch:
 
 
 class CurriculumStageSchedule:
-    """Turn capability stages into terrain, goal and randomization tasks.
-
-    A curriculum stage is deliberately not a terrain index.  One stage may
-    mix several terrain primitives, while the same primitive may reappear in
-    later stages at a greater geometric difficulty.
+    """ 将“能力阶段(stage)”映射为具体任务分布（地形权重、几何难度区间、目标距离与朝向范围、域随机化规模）。
+        接收阶段配置字典并构建张量化表格，支持按前沿/重放/挑战三类概率采样阶段。
+        提供 sample() 用于按并行环境批量返回 CurriculumTaskBatch
     """
 
     def __init__(self, stage_configs: dict, terrain_names, device) -> None:
@@ -233,13 +231,9 @@ class CurriculumStageSchedule:
 
 
 class CapabilityCurriculum:
-    """One shared curriculum frontier mirrored across all parallel environments.
-
-    Parallel environments are rollout workers, not independent learners. A
-    single shared state makes sampling consistent and lets every completed
-    frontier episode contribute to the same statistically meaningful gate.
-    Public tensors retain one value per environment so the environment can use
-    them without scalar synchronization or host-device transfers.
+    """ 管理共享的课程前沿（每个并行环境有同一“等级”值），跟踪成功率、集数、以及“满难度成功率”。
+        update(...) 用于在若干环境回报后更新成功率并决定是否升/降等级；frontier_difficulty(...) 返回平滑化的 [0,1] 难度尺度。
+        设计用于使多个 rollout worker 使用同一前沿，便于统计门控。
     """
 
     def __init__(

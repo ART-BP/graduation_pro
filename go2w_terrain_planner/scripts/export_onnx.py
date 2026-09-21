@@ -26,6 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", default="/workspace/data/export/planner.onnx")
     parser.add_argument("--map-size", type=int, default=None)
+    parser.add_argument(
+        "--opset-version",
+        type=int,
+        choices=range(13, 18),
+        default=17,
+        help="ONNX opset; use 16 for the TensorRT 8.5 deployment on Jetson",
+    )
     parser.add_argument("--project-config-dir", "--project_config_dir", dest="project_config_dir", default=None)
     return parser.parse_args()
 
@@ -100,7 +107,7 @@ def main() -> None:
         input_names=["policy_observation"],
         output_names=["velocity_command"],
         dynamic_axes={"policy_observation": {0: "batch"}, "velocity_command": {0: "batch"}},
-        opset_version=17,
+        opset_version=args.opset_version,
     )
     print(f"ONNX exported to {output}")
 

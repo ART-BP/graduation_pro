@@ -1,0 +1,26 @@
+model:
+  # The current actor overflows inside TensorRT 8.5 when all layers use FP16.
+  # Keep FP32 unless the exported model is retrained/validated for mixed precision.
+  enable_fp16: false
+  workspace_megabytes: 512
+
+topics:
+  grid_map: /local_environment/grid_map
+  ground_reference: /local_environment/ground_reference
+  odometry: /Odometry
+  # RViz "2D Nav Goal" publishes geometry_msgs/PoseStamped here.
+  goal: /move_base_simple/goal
+  # Shadow topics are deliberately separate from the robot's /cmd_vel.
+  cmd_vel: /go2w_terrain_planner/cmd_vel_shadow
+  cmd_vel_stamped: /go2w_terrain_planner/cmd_vel_shadow_stamped
+  diagnostics: /go2w_terrain_planner/diagnostics
+  prediction_marker: /go2w_terrain_planner/predicted_motion
+
+safety:
+  minimum_observed_ratio: 0.05
+  minimum_height_valid_ratio: 0.01
+  goal_tolerance_m: 0.30
+
+sync:
+  tolerance_s: 0.03
+  queue_size: 10

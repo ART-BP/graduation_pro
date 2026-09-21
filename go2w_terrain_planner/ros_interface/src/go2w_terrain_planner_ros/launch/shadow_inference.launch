@@ -1,0 +1,16 @@
+<launch>
+  <arg name="onnx_path" default=""/>
+  <arg name="engine_path" default=""/>
+  <arg name="config"
+       default="$(find go2w_terrain_planner_ros)/config/inference.yaml"/>
+
+  <node pkg="go2w_terrain_planner_ros"
+        type="go2w_policy_inference_node"
+        name="go2w_policy_inference"
+        output="screen"
+        required="true">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="model/onnx_path" value="$(arg onnx_path)"/>
+    <param name="model/engine_path" value="$(arg engine_path)"/>
+  </node>
+</launch>
