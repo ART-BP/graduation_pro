@@ -10,12 +10,14 @@ def build_compact_map_observation(
     previous_aligned_fused_map,
     aligned_observation_history,
 ):
-    """Build current-map, recent-change, age, and confidence channels.
+    """融合本地地图编码（7 通道输出）
 
-    The four fused-map channels retain the physical map contract.  One
-    additional channel describes recent cell change, while normalized age and
-    repeated-observation confidence make stale and unknown cells explicit.
-    No complete historical map is exposed to PPO.
+        输入：当前融合地图（4 通道）、上一张对齐的融合地图、对齐的观测时序历史
+        处理：计算地形近期变化（地面高度变、高度差变）、观测年龄（多久未被新数据覆盖）、观测置信度（时间加权）
+        输出：7 通道张量 [B, 7, H, W]，其中前 4 通道是原始融合地图，后 3 通道分别为：
+        recent_change: [0,1] 最近一步内的几何或掩膜变化程度
+        age: [0,1] 最老被观测样本的相对年龄（越新为 0，越老为 1）
+        confidence: [0,1] 基于历史观测加权的置信度（时间衰减权）
     """
     import torch
 
@@ -102,7 +104,13 @@ def normalize_policy_auxiliary_inputs(
     velocity_scale,
     map_extent_m: float,
 ):
-    """Normalize deployable non-map inputs with fixed physical scales."""
+    """非地图输入归一化
+
+        输入：当前速度、指令历史、运动历史（轨迹）+ 物理尺度参数
+        处理：
+        速度与指令 / velocity_scale（通常是最大线速度与角速度，例如 [1.0, 1.0]）
+        运动中的 xy 位移 / (0.5 × map_extent_m)；偏航角 / π
+        输出：归一化后的速度、指令、运动张量（[-1, 1] 范围便于网络学习）"""
     import torch
 
     if map_extent_m <= 0.0:
@@ -139,7 +147,14 @@ def assemble_policy_observation(
     map_extent_m: float,
     expected_dimension: int | None = None,
 ):
-    """Assemble the deployable actor observation without privileged state."""
+    """完整观测拼装
+
+        输入：紧凑地图、目标位置、当前速度、指令历史、运动历史、可选 IMU 历史 + 物理参数
+        处理：
+        调用上面两个函数进行地图编码与归一化
+        将所有张量按维度 -1 拼接为单一向量（展平二维/三维部分）
+        输出：单一向量 [B, D]，其中 D = 地图展平维度(7×H×W) + 目标(3) + 速度(2) + 指令展平(T×2) + 运动展平(T×3) [+ IMU展平(T×5)]
+        可选校验：检查输出维度是否与预期相符（用于捕捉配置错误）"""
     import torch
 
     if compact_map.ndim != 4:
