@@ -1,0 +1,28 @@
+<launch>
+  <arg name="model"
+       default="$(find go2w_policy_deployment)/models/planner.onnx"/>
+  <arg name="start_fast_lio" default="true"/>
+  <arg name="fast_lio_rviz" default="true"/>
+  <arg name="start_enabled" default="false"/>
+  <arg name="lidar_input_topic" default="/lidar_points"/>
+  <arg name="cloud_topic" default="/cloud_registered"/>
+  <arg name="odometry_topic" default="/Odometry"/>
+  <arg name="goal_topic" default="/local_goal"/>
+  <arg name="command_topic" default="/cmd_vel"/>
+
+  <include file="$(find go2w_local_environment)/launch/local_mapping_pipeline.launch">
+    <arg name="start_fast_lio" value="$(arg start_fast_lio)"/>
+    <arg name="fast_lio_rviz" value="$(arg fast_lio_rviz)"/>
+    <arg name="lidar_input_topic" value="$(arg lidar_input_topic)"/>
+    <arg name="cloud_topic" value="$(arg cloud_topic)"/>
+    <arg name="odometry_topic" value="$(arg odometry_topic)"/>
+  </include>
+
+  <include file="$(find go2w_policy_deployment)/launch/policy.launch">
+    <arg name="model" value="$(arg model)"/>
+    <arg name="start_enabled" value="$(arg start_enabled)"/>
+    <arg name="odometry_topic" value="$(arg odometry_topic)"/>
+    <arg name="goal_topic" value="$(arg goal_topic)"/>
+    <arg name="command_topic" value="$(arg command_topic)"/>
+  </include>
+</launch>

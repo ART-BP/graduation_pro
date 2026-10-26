@@ -102,7 +102,9 @@ height_valid_mask = isfinite(ground_height) AND isfinite(height_range)
 
 所有无效高度都被固定值替换，进入网络的张量不允许包含 `NaN` 或 `Inf`。地面高程按`±1 m`归一化，高度差保持`0～3 m`覆盖范围；网络直接使用`200 × 200`地图。
 
-实机部署适配器应直接输出机器人中心坐标系下的四通道地图，再进入 `TemporalGridBuffer`；仿真端和实机端都约定地图第一维为机器人前向、第二维为机器人左向。
+实机部署适配器位于 `local_map_ws/src/go2w_policy_deployment`。它将 odom
+轴对齐的 Grid Map 重采样为机器人中心坐标系下的四通道地图，并在 C++ 中复现
+`TemporalGridBuffer` 的对齐与融合语义；仿真端和实机端都约定地图第一维为机器人前向、第二维为机器人左向。
 
 Actor 输入为：
 

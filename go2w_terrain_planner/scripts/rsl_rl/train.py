@@ -143,6 +143,7 @@ from go2w_terrain_planner.utils.config_loader import (
 from go2w_terrain_planner.utils.logging_utils import (
     mirror_latest_checkpoint,
     prepare_run_directory,
+    reset_optimizer_learning_rate,
     validate_checkpoint,
     validate_module_parameters,
     validate_ppo_loss_dict,
@@ -329,6 +330,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 flush=True,
             )
         validate_module_parameters(runner.alg.policy, label="载入后的policy")
+
+    # 严格续训会恢复checkpoint中的optimizer参数组，其中包含旧学习率。
+    # 始终以当前项目配置覆盖，确保fixed调度实际保持在指定值。
+    configured_learning_rate = float(agent_cfg.algorithm.learning_rate)
+    reset_optimizer_learning_rate(runner.alg, configured_learning_rate)
+    print(
+        "[INFO] PPO learning rate configured: "
+        f"schedule={agent_cfg.algorithm.schedule}, "
+        f"learning_rate={configured_learning_rate:.2e}",
+        flush=True,
+    )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

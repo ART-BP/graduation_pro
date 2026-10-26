@@ -1,0 +1,28 @@
+<launch>
+  <arg name="config"
+       default="$(find go2w_policy_deployment)/config/policy.yaml"/>
+  <arg name="model"
+       default="$(find go2w_policy_deployment)/models/planner.onnx"/>
+  <arg name="start_enabled" default="false"/>
+  <arg name="map_topic" default="/local_environment/grid_map"/>
+  <arg name="odometry_topic" default="/Odometry"/>
+  <arg name="ground_reference_topic"
+       default="/local_environment/ground_reference"/>
+  <arg name="goal_topic" default="/local_goal"/>
+  <arg name="command_topic" default="/cmd_vel"/>
+
+  <node pkg="go2w_policy_deployment"
+        type="go2w_policy_node"
+        name="go2w_policy"
+        output="screen"
+        required="true">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="model/path" value="$(arg model)"/>
+    <param name="safety/start_enabled" value="$(arg start_enabled)"/>
+    <param name="topics/map" value="$(arg map_topic)"/>
+    <param name="topics/odometry" value="$(arg odometry_topic)"/>
+    <param name="topics/ground_reference" value="$(arg ground_reference_topic)"/>
+    <param name="topics/goal" value="$(arg goal_topic)"/>
+    <param name="topics/command" value="$(arg command_topic)"/>
+  </node>
+</launch>

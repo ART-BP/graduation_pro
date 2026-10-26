@@ -1,15 +1,34 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from go2w_terrain_planner.utils.logging_utils import (
     mirror_latest_checkpoint,
     prepare_run_directory,
+    reset_optimizer_learning_rate,
     validate_checkpoint,
     validate_module_parameters,
     validate_ppo_loss_dict,
 )
+
+
+def test_reset_optimizer_learning_rate_overrides_checkpoint_value() -> None:
+    algorithm = SimpleNamespace(
+        learning_rate=1.0e-2,
+        optimizer=SimpleNamespace(
+            param_groups=[{"lr": 1.0e-2}, {"lr": 1.0e-2}],
+        ),
+    )
+
+    reset_optimizer_learning_rate(algorithm, 1.0e-4)
+
+    assert algorithm.learning_rate == pytest.approx(1.0e-4)
+    assert [group["lr"] for group in algorithm.optimizer.param_groups] == [
+        pytest.approx(1.0e-4),
+        pytest.approx(1.0e-4),
+    ]
 
 
 def test_run_metadata_and_checkpoint_mirror(tmp_path: Path) -> None:

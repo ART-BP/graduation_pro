@@ -26,6 +26,18 @@ compile_commands.json
 *.dll
 *.exe
 
+# Trained/exported policy artifacts (keep these outside Git/LFS by default)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.plan
+go2w_terrain_planner/data/go2w_training/
+go2w_terrain_planner/data/go2w_training.zip
+go2w_terrain_planner/data/metrics.json
+local_map_ws/src/go2w_policy_deployment/models/*
+!local_map_ws/src/go2w_policy_deployment/models/.gitkeep
+
 # ROS runtime data
 *.bag
 *.bag.active

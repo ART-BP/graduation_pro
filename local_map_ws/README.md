@@ -13,6 +13,15 @@
                     ↓
     /local_environment/grid_map
 
+可选的学习型策略部署链路：
+
+    /local_environment/grid_map + /Odometry
+    + /local_environment/ground_reference + /local_goal
+                    ↓
+    go2w_policy_deployment（C++ / ONNX Runtime）
+                    ↓
+                 /cmd_vel
+
 ## 输出通道
 
 Grid Map 只包含三个固定图层：
@@ -52,6 +61,13 @@ Grid Map 只包含三个固定图层：
     ./build.sh
 
 本工作区只依赖 ROS Noetic、PCL、message_filters 和随源码保留的最小 Grid Map 包，不再依赖或编译 ROG-Map。
+
+只构建局部地图时，缺少 ONNX Runtime 不会导致工作区构建失败；CMake 会跳过
+策略可执行文件。部署策略时需要传入目标机器架构对应的 SDK：
+
+    ./build.sh -DONNXRUNTIME_ROOT=/opt/onnxruntime
+
+策略包的详细说明位于 `src/go2w_policy_deployment/README.md`。
 
 ## 启动
 

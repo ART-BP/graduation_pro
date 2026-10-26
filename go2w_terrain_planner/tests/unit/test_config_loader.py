@@ -40,7 +40,8 @@ def test_project_configuration_is_consistent() -> None:
     assert config["model"]["motion_gru_hidden_dim"] == 128
     assert config["model"]["fusion_hidden_dim"] == 384
     assert config["ppo"]["entropy_coef"] == 0.001
-    assert config["ppo"]["schedule"] == "adaptive"
+    assert config["ppo"]["learning_rate"] == 1.0e-4
+    assert config["ppo"]["schedule"] == "fixed"
     assert config["curriculum"]["frontier_sampling_probability"] == 0.60
     assert config["curriculum"]["challenge_sampling_probability"] == 0.05
     assert config["curriculum"]["allow_level_demotion"] is False

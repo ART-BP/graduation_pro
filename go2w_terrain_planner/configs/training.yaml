@@ -18,9 +18,9 @@ ppo:
   entropy_coef: 0.001
   num_learning_epochs: 3
   num_mini_batches: 8
-  learning_rate: 5.0e-05
-  # 启用RSL-RL的KL自适应学习率，使desired_kl实际参与更新控制。
-  schedule: adaptive
+  # 最终课程阶段使用固定小学习率，避免KL自适应调度升至1e-2后破坏已学策略。
+  learning_rate: 1.0e-04
+  schedule: fixed
   gamma: 0.997
   lam: 0.98
   desired_kl: 0.01

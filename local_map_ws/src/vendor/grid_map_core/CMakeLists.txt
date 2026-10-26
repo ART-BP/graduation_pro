@@ -96,11 +96,13 @@ install(
   FILES_MATCHING PATTERN "*.hpp"
 )
 
-# Mark other files for installation
-install(
-  DIRECTORY doc
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-)
+# The workspace vendors a source-minimal grid_map_core without upstream docs.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/doc")
+  install(
+    DIRECTORY doc
+    DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+  )
+endif()
 
 #############
 ## Testing ##

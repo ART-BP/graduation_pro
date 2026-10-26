@@ -95,6 +95,17 @@
 - 推理速度
 - Jetson 部署性能
 
+## C++ 策略部署
+
+`local_map_ws/src/go2w_policy_deployment` 提供 ROS1 C++ 部署节点。训练得到的
+RSL-RL `.pt` checkpoint 先在训练容器中一次性导出为 ONNX，机器狗端使用
+ONNX Runtime C++ 接收局部高程图、里程计、高度参考和局部目标，输出
+`geometry_msgs/Twist` 速度指令。
+
+完整的模型导出、ONNX Runtime 安装、编译、启动和安全使能步骤见
+`local_map_ws/src/go2w_policy_deployment/README.md`。节点默认禁用，输入超时、
+地图覆盖不足、无目标或推理异常时发布零速度。
+
 ## 系统链路（0717）
 
 ```text

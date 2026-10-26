@@ -1,0 +1,58 @@
+# This file mirrors the current compact_map_motion_gru_v7 training contract.
+# Changing any map/history value requires exporting a matching checkpoint.
+model:
+  path: ""
+
+runtime:
+  intra_op_threads: 2
+
+map:
+  size: 200
+  channels: 7
+  extent_m: 10.0
+  ground_height_scale_m: 1.0
+  height_range_scale_m: 3.0
+  maximum_ground_deviation: 0.06
+  fusion_span_percentile: 0.75
+
+history:
+  observation_fusion_length: 12
+  command_length: 8
+  motion_length: 8
+
+goal:
+  maximum_distance_m: 10.0
+
+action:
+  # Normalization scales used during training.
+  linear_velocity_scale_mps: 1.2
+  angular_velocity_scale_radps: 1.0
+
+  # Physical limits embedded in the exported ONNX model.
+  linear_min_mps: -0.2
+  linear_max_mps: 1.2
+  angular_min_radps: -1.0
+  angular_max_radps: 1.0
+  linear_acceleration_limit_mps2: 0.8
+  angular_acceleration_limit_radps2: 1.0
+  apply_acceleration_limits: true
+
+safety:
+  # A deliberate service call is required before commands can move the robot.
+  start_enabled: false
+  input_timeout_s: 0.5
+  goal_tolerance_m: 0.30
+  minimum_observed_ratio: 0.05
+  minimum_height_valid_ratio: 0.01
+
+topics:
+  map: /local_environment/grid_map
+  odometry: /Odometry
+  ground_reference: /local_environment/ground_reference
+  goal: /local_goal
+  command: /cmd_vel
+
+sync:
+  queue_size: 10
+  subscriber_queue_size: 5
+  tolerance_s: 0.05

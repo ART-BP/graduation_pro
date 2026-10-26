@@ -93,6 +93,25 @@ def mirror_latest_checkpoint(run_directory: str | Path) -> Path:
     return destination
 
 
+def reset_optimizer_learning_rate(algorithm, learning_rate: float) -> None:
+    """Apply the configured learning rate after loading optimizer state.
+
+    RSL-RL checkpoints restore optimizer parameter groups, including their old
+    learning rate.  Updating only the YAML or ``algorithm.learning_rate`` would
+    therefore leave strict resume runs using the checkpoint value.
+    """
+    value = float(learning_rate)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("optimizer学习率必须是有限正数")
+    optimizer = getattr(algorithm, "optimizer", None)
+    parameter_groups = getattr(optimizer, "param_groups", None)
+    if not parameter_groups:
+        raise ValueError("PPO algorithm缺少有效的optimizer参数组")
+    algorithm.learning_rate = value
+    for parameter_group in parameter_groups:
+        parameter_group["lr"] = value
+
+
 def _non_finite_tensor_paths(value, prefix: str = "checkpoint") -> list[str]:
     """Return paths of floating-point tensors containing NaN or Inf."""
     import torch
